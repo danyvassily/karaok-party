@@ -5,10 +5,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, SampleRate, Stream, StreamConfig};
+use cpal::{SampleFormat, Stream, StreamConfig};
 use karaok_core::{
-    AudioBufferSize, LoopRegion, MicChannelId, MusicalKey, PlaybackTelemetry, RecordingEntry,
-    StemMix, VocalDspParams,
+    AudioBufferSize, AudioOutputDeviceInfo, LoopRegion, MicChannelId, MusicalKey,
+    PlaybackTelemetry, RecordingEntry, StemMix, VocalDspParams,
 };
 use karaok_dsp::{soft_limit, VocalDspChain};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
@@ -181,7 +181,71 @@ impl CalibrationDelayLine {
     }
 }
 
-/// Complete real-time CoreAudio engine for Karaok Party.
+/// Lists all usable CoreAudio output devices visible to macOS (MacBook speakers, Bluetooth
+/// speakers like HECATE/RS-620, HDMI TVs, wired headphones, etc.).
+pub fn list_audio_output_devices() -> Vec<AudioOutputDeviceInfo> {
+    let host = cpal::default_host();
+    let default_name = host.default_output_device().and_then(|d| d.name().ok());
+
+    let Ok(devices) = host.output_devices() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for dev in devices {
+        let Ok(name) = dev.name() else { continue };
+        let Ok(cfg) = dev.default_output_config() else {
+            continue;
+        };
+        let sr = cfg.sample_rate().0;
+        if sr == 0 || cfg.channels() == 0 {
+            continue;
+        }
+        let is_default = default_name.as_deref() == Some(name.as_str());
+        out.push(AudioOutputDeviceInfo {
+            name,
+            is_default,
+            sample_rate: sr,
+            channels: cfg.channels(),
+        });
+    }
+
+    out.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    out
+}
+
+/// Holds the lock-free SPSC handles owned by the CoreAudio output callback while running.
+struct OutputConsumers {
+    music_cons: HeapCons<f32>,
+    mic1_cons: HeapCons<f32>,
+    mic2_cons: HeapCons<f32>,
+    rec_prod: HeapProd<RecordedFrame>,
+}
+
+/// RAII guard living inside the CoreAudio callback closure: zero locks during audio rendering,
+/// and automatically returns `OutputConsumers` back to `AudioEngine` when the stream is dropped
+/// on the control thread during live output-device hot-switching.
+struct RtOutputBundle {
+    inner: Option<OutputConsumers>,
+    return_slot: Arc<Mutex<Option<OutputConsumers>>>,
+}
+
+impl Drop for RtOutputBundle {
+    fn drop(&mut self) {
+        if let Some(bundle) = self.inner.take() {
+            if let Ok(mut slot) = self.return_slot.lock() {
+                *slot = Some(bundle);
+            }
+        }
+    }
+}
+
+/// Complete real-time CoreAudio engine for Karaok Party with live output-device switching.
 pub struct AudioEngine {
     state: Arc<AtomicEngineState>,
     loaded_track: Arc<Mutex<Option<Arc<LoadedStemTrack>>>>,
@@ -190,13 +254,11 @@ pub struct AudioEngine {
     /// Pre-allocated permanent SPSC consumer returned here whenever recording is idle,
     /// so the CoreAudio callback NEVER locks or drops its permanent `HeapProd<RecordedFrame>`.
     rec_consumer: Mutex<Option<HeapCons<RecordedFrame>>>,
-    rec_producer: Mutex<Option<HeapProd<RecordedFrame>>>,
+    output_consumers: Arc<Mutex<Option<OutputConsumers>>>,
+    active_output_device: Mutex<Option<String>>,
     shutdown: Arc<AtomicBool>,
     _feeder_thread: Option<JoinHandle<()>>,
     output_stream: Mutex<Option<Stream>>,
-    // Held only until CoreAudio stream starts
-    mic_consumers: Mutex<Option<[HeapCons<f32>; 2]>>,
-    music_consumer: Mutex<Option<HeapCons<f32>>>,
 }
 
 // Safety: `cpal::Stream` is guarded by Mutex and only created/dropped on control threads.
@@ -205,7 +267,7 @@ unsafe impl Sync for AudioEngine {}
 
 impl AudioEngine {
     /// Initializes the lock-free audio graph and returns `(AudioEngine, [Mic1Producer, Mic2Producer])`.
-    /// Call `start_coreaudio_stream()` to attach to the macOS CoreAudio output device.
+    /// Call `start_coreaudio_stream()` or `select_output_device()` to attach to a macOS CoreAudio output.
     pub fn new() -> (Self, [MicAudioProducer; 2]) {
         let state = Arc::new(AtomicEngineState::default());
         let loaded_track: Arc<Mutex<Option<Arc<LoadedStemTrack>>>> = Arc::new(Mutex::new(None));
@@ -216,7 +278,7 @@ impl AudioEngine {
         let music_rb = HeapRb::<f32>::new(MASTER_SAMPLE_RATE as usize * 2 / 5);
         let (music_prod, music_cons) = music_rb.split();
 
-        // Mic 1 & Mic 2 mono ring buffers: ~340 ms headroom each for smooth Continuity Wi-Fi bursts
+        // Mic 1 & Mic 2 mono ring buffers: ~340 ms headroom each
         let mic1_rb = HeapRb::<f32>::new(16_384);
         let mic2_rb = HeapRb::<f32>::new(16_384);
         let (mic1_prod, mic1_cons) = mic1_rb.split();
@@ -237,18 +299,24 @@ impl AudioEngine {
             })
             .ok();
 
+        let consumers = OutputConsumers {
+            music_cons,
+            mic1_cons,
+            mic2_cons,
+            rec_prod,
+        };
+
         let engine = Self {
             state,
             loaded_track,
             current_track_id: Arc::new(Mutex::new(None)),
             active_recording: Mutex::new(None),
             rec_consumer: Mutex::new(Some(rec_cons)),
-            rec_producer: Mutex::new(Some(rec_prod)),
+            output_consumers: Arc::new(Mutex::new(Some(consumers))),
+            active_output_device: Mutex::new(None),
             shutdown,
             _feeder_thread: feeder_thread,
             output_stream: Mutex::new(None),
-            mic_consumers: Mutex::new(Some([mic1_cons, mic2_cons])),
-            music_consumer: Mutex::new(Some(music_cons)),
         };
 
         (
@@ -264,174 +332,295 @@ impl AudioEngine {
         Arc::clone(&self.state)
     }
 
-    /// Starts the CoreAudio output stream at 48 kHz with `buffer_size` (64, 128, or 256 frames).
-    /// Returns `Ok(())` on macOS hardware, or `Err` if no output audio device is available.
+    pub fn active_output_device(&self) -> Option<String> {
+        self.active_output_device.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Starts the CoreAudio output stream on the macOS default output device (adapting cleanly
+    /// to its native sample rate, channel count, and buffer size).
     pub fn start_coreaudio_stream(&self, buffer_size: AudioBufferSize) -> AudioResult<()> {
         self.state
             .buffer_size
             .store(buffer_size.as_u32(), Ordering::Relaxed);
+        self.select_output_device(None)
+    }
+
+    /// Hot-switches the active CoreAudio output device (e.g. `Haut-parleurs MacBook Pro`,
+    /// `HECATE G1000 II`, `RS-620`, HDMI TV, `Écouteurs externes`, or `None` for system default).
+    ///
+    /// Automatically matches the target speaker's native sample rate (44.1 kHz, 48 kHz, etc.)
+    /// and channel count using zero-allocation linear resampling from our 48 kHz internal bus.
+    pub fn select_output_device(&self, device_name: Option<&str>) -> AudioResult<()> {
+        // 1. Stop & drop the previous stream cleanly on the control thread so `RtOutputBundle`
+        // returns its lock-free SPSC handles back into `self.output_consumers`.
+        {
+            let mut stream_guard = self
+                .output_stream
+                .lock()
+                .map_err(|_| AudioError::Device("Output stream lock poisoned".into()))?;
+            *stream_guard = None;
+        }
 
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| AudioError::Device("No default CoreAudio output device found".into()))?;
-
-        let config = StreamConfig {
-            channels: 2,
-            sample_rate: SampleRate(MASTER_SAMPLE_RATE),
-            buffer_size: BufferSize::Fixed(buffer_size.as_u32()),
+        let device = if let Some(target) = device_name.filter(|s| !s.trim().is_empty()) {
+            host.output_devices()
+                .map_err(|e| AudioError::Device(e.to_string()))?
+                .find(|d| d.name().ok().as_deref() == Some(target))
+                .ok_or_else(|| {
+                    AudioError::Device(format!("Sortie audio introuvable : « {target} »"))
+                })?
+        } else {
+            host.default_output_device()
+                .ok_or_else(|| AudioError::Device("Aucune sortie audio CoreAudio détectée".into()))?
         };
 
-        let mut music_cons = self
-            .music_consumer
-            .lock()
-            .map_err(|_| AudioError::Device("Lock poisoned".into()))?
-            .take()
-            .ok_or_else(|| AudioError::Device("Audio stream already started".into()))?;
+        let resolved_name = device.name().unwrap_or_else(|_| "Sortie par défaut".into());
+        let default_cfg = device
+            .default_output_config()
+            .map_err(|e| AudioError::Device(e.to_string()))?;
+        let sample_format = default_cfg.sample_format();
+        let config: StreamConfig = default_cfg.into();
+        let out_rate = config.sample_rate.0.max(8000);
+        let out_channels = config.channels.max(1) as usize;
 
-        let [mut mic1_cons, mut mic2_cons] = self
-            .mic_consumers
+        let consumers = self
+            .output_consumers
             .lock()
-            .map_err(|_| AudioError::Device("Lock poisoned".into()))?
+            .map_err(|_| AudioError::Device("Output consumers lock poisoned".into()))?
             .take()
-            .ok_or_else(|| AudioError::Device("Mic consumers already bound".into()))?;
+            .ok_or_else(|| AudioError::Device("Audio consumers unavailable".into()))?;
 
-        let mut rec_prod = self
-            .rec_producer
-            .lock()
-            .map_err(|_| AudioError::Device("Lock poisoned".into()))?
-            .take()
-            .ok_or_else(|| AudioError::Device("Recording producer already bound".into()))?;
-
+        let mut rt_bundle = RtOutputBundle {
+            inner: Some(consumers),
+            return_slot: Arc::clone(&self.output_consumers),
+        };
         let state = Arc::clone(&self.state);
 
-        // Pre-allocate ALL DSP state BEFORE entering the CoreAudio real-time thread!
+        // Pre-allocate ALL DSP & output resampling state BEFORE entering CoreAudio RT thread!
         let mut mic1_dsp = VocalDspChain::new(MASTER_SAMPLE_RATE as f32);
         let mut mic2_dsp = VocalDspChain::new(MASTER_SAMPLE_RATE as f32);
         let mut calibration_delay = CalibrationDelayLine::new();
-        // ~10.6 ms cushion (512 samples) prevents zero-stuffed crackling on iPhone Continuity bursts
         let mut mic1_primed = false;
         let mut mic2_primed = false;
         let mut mic1_last = 0.0_f32;
         let mut mic2_last = 0.0_f32;
 
-        let stream = device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    // STRICT REAL-TIME CALLBACK:
-                    // Zero heap allocations, zero deallocations, zero locks/try_lock, zero syscalls, zero unwrap().
-                    if state.flush_music.swap(false, Ordering::AcqRel) {
-                        while music_cons.try_pop().is_some() {}
-                    }
+        // Zero-alloc inline output resampler (internal 48 kHz -> speaker native rate e.g. 44.1 / 48 kHz)
+        let rate_step: f64 = (MASTER_SAMPLE_RATE as f64) / (out_rate as f64);
+        let mut phase: f64 = 0.0;
+        let mut prev_l = 0.0_f32;
+        let mut prev_r = 0.0_f32;
+        let mut curr_l = 0.0_f32;
+        let mut curr_r = 0.0_f32;
 
-                    let is_playing = state.is_playing.load(Ordering::Relaxed);
-                    let effective_key = state.effective_key();
-                    let mic1_params = state.mic_params[0].load();
-                    let mic2_params = state.mic_params[1].load();
-                    let is_recording = state.is_recording.load(Ordering::Relaxed);
-                    let delay_ms = state
-                        .latency_calibration_ms
-                        .load(Ordering::Relaxed)
-                        .min(250) as usize;
-                    let delay_frames = (delay_ms * MASTER_SAMPLE_RATE as usize) / 1000;
+        let mut render_next_stereo_frame = move || -> (f32, f32) {
+            // STRICT REAL-TIME RENDER STEP: zero allocations, zero locks, zero syscalls, zero unwrap().
+            let Some(ref mut c) = rt_bundle.inner else {
+                return (0.0, 0.0);
+            };
 
-                    if !mic1_primed && mic1_cons.occupied_len() >= 512 {
-                        mic1_primed = true;
-                    }
-                    if !mic2_primed && mic2_cons.occupied_len() >= 512 {
-                        mic2_primed = true;
-                    }
-                    // Keep input latency tight (< 40 ms = 1920 samples) if clock drifts slightly fast
-                    if mic1_cons.occupied_len() > 2400 {
-                        let drop_n = mic1_cons.occupied_len() - 512;
-                        for _ in 0..drop_n {
-                            let _ = mic1_cons.try_pop();
-                        }
-                    }
-                    if mic2_cons.occupied_len() > 2400 {
-                        let drop_n = mic2_cons.occupied_len() - 512;
-                        for _ in 0..drop_n {
-                            let _ = mic2_cons.try_pop();
-                        }
-                    }
+            if state.flush_music.swap(false, Ordering::AcqRel) {
+                while c.music_cons.try_pop().is_some() {}
+            }
 
-                    for frame in data.chunks_exact_mut(2) {
-                        let (raw_music_l, raw_music_r) = if is_playing {
-                            (
-                                music_cons.try_pop().unwrap_or(0.0),
-                                music_cons.try_pop().unwrap_or(0.0),
-                            )
-                        } else {
-                            (0.0, 0.0)
-                        };
+            let is_playing = state.is_playing.load(Ordering::Relaxed);
+            let effective_key = state.effective_key();
+            let mic1_params = state.mic_params[0].load();
+            let mic2_params = state.mic_params[1].load();
+            let is_recording = state.is_recording.load(Ordering::Relaxed);
+            let delay_ms = state
+                .latency_calibration_ms
+                .load(Ordering::Relaxed)
+                .min(250) as usize;
+            let delay_frames = (delay_ms * MASTER_SAMPLE_RATE as usize) / 1000;
 
-                        let (instru_l, instru_r) =
-                            calibration_delay.process(raw_music_l, raw_music_r, delay_frames);
+            if !mic1_primed && c.mic1_cons.occupied_len() >= 256 {
+                mic1_primed = true;
+            }
+            if !mic2_primed && c.mic2_cons.occupied_len() >= 256 {
+                mic2_primed = true;
+            }
+            if c.mic1_cons.occupied_len() > 2400 {
+                let drop_n = c.mic1_cons.occupied_len() - 384;
+                for _ in 0..drop_n {
+                    let _ = c.mic1_cons.try_pop();
+                }
+            }
+            if c.mic2_cons.occupied_len() > 2400 {
+                let drop_n = c.mic2_cons.occupied_len() - 384;
+                for _ in 0..drop_n {
+                    let _ = c.mic2_cons.try_pop();
+                }
+            }
 
-                        let raw_m1 = if mic1_primed {
-                            if let Some(s) = mic1_cons.try_pop() {
-                                mic1_last = s;
-                                s
+            // Produce one internal 48 kHz mixed stereo frame
+            let mut produce_48k = || -> (f32, f32) {
+                let (raw_music_l, raw_music_r) = if is_playing {
+                    (
+                        c.music_cons.try_pop().unwrap_or(0.0),
+                        c.music_cons.try_pop().unwrap_or(0.0),
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+
+                let (instru_l, instru_r) =
+                    calibration_delay.process(raw_music_l, raw_music_r, delay_frames);
+
+                let raw_m1 = if mic1_primed {
+                    if let Some(s) = c.mic1_cons.try_pop() {
+                        mic1_last = s;
+                        s
+                    } else {
+                        mic1_primed = false;
+                        mic1_last *= 0.9;
+                        mic1_last
+                    }
+                } else {
+                    mic1_last *= 0.9;
+                    mic1_last
+                };
+
+                let raw_m2 = if mic2_primed {
+                    if let Some(s) = c.mic2_cons.try_pop() {
+                        mic2_last = s;
+                        s
+                    } else {
+                        mic2_primed = false;
+                        mic2_last *= 0.9;
+                        mic2_last
+                    }
+                } else {
+                    mic2_last *= 0.9;
+                    mic2_last
+                };
+
+                let (m1_l, m1_r) = mic1_dsp.process_sample(raw_m1, effective_key, &mic1_params);
+                let (m2_l, m2_r) = mic2_dsp.process_sample(raw_m2, effective_key, &mic2_params);
+
+                if is_recording {
+                    let _ = c.rec_prod.try_push(RecordedFrame {
+                        instru_l,
+                        instru_r,
+                        mic1_l: m1_l,
+                        mic1_r: m1_r,
+                        mic2_l: m2_l,
+                        mic2_r: m2_r,
+                    });
+                }
+
+                (
+                    soft_limit(instru_l + m1_l + m2_l),
+                    soft_limit(instru_r + m1_r + m2_r),
+                )
+            };
+
+            let out = if (rate_step - 1.0).abs() < 1e-6 {
+                produce_48k()
+            } else {
+                phase += rate_step;
+                while phase >= 1.0 {
+                    phase -= 1.0;
+                    prev_l = curr_l;
+                    prev_r = curr_r;
+                    let (nl, nr) = produce_48k();
+                    curr_l = nl;
+                    curr_r = nr;
+                }
+                let t = phase as f32;
+                (prev_l + (curr_l - prev_l) * t, prev_r + (curr_r - prev_r) * t)
+            };
+
+            // Publish lock-free telemetry
+            state
+                .music_buffered_frames
+                .store((c.music_cons.occupied_len() / 2) as u64, Ordering::Relaxed);
+            state.mic_telemetry[0].store_dsp(mic1_dsp.telemetry(), mic1_params.muted);
+            state.mic_telemetry[1].store_dsp(mic2_dsp.telemetry(), mic2_params.muted);
+
+            out
+        };
+
+        let err_dev = resolved_name.clone();
+        let err_fn = move |err: cpal::StreamError| {
+            warn!("CoreAudio output error on '{err_dev}': {err}");
+        };
+
+        let stream = match sample_format {
+            SampleFormat::F32 => device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        for frame in data.chunks_exact_mut(out_channels) {
+                            let (l, r) = render_next_stereo_frame();
+                            if out_channels == 1 {
+                                frame[0] = 0.5 * (l + r);
                             } else {
-                                mic1_primed = false;
-                                mic1_last *= 0.9;
-                                mic1_last
+                                frame[0] = l;
+                                frame[1] = r;
+                                for extra in frame.iter_mut().skip(2) {
+                                    *extra = 0.0;
+                                }
                             }
-                        } else {
-                            mic1_last *= 0.9;
-                            mic1_last
-                        };
-
-                        let raw_m2 = if mic2_primed {
-                            if let Some(s) = mic2_cons.try_pop() {
-                                mic2_last = s;
-                                s
-                            } else {
-                                mic2_primed = false;
-                                mic2_last *= 0.9;
-                                mic2_last
-                            }
-                        } else {
-                            mic2_last *= 0.9;
-                            mic2_last
-                        };
-
-                        let (m1_l, m1_r) =
-                            mic1_dsp.process_sample(raw_m1, effective_key, &mic1_params);
-                        let (m2_l, m2_r) =
-                            mic2_dsp.process_sample(raw_m2, effective_key, &mic2_params);
-
-                        if is_recording {
-                            let _ = rec_prod.try_push(RecordedFrame {
-                                instru_l,
-                                instru_r,
-                                mic1_l: m1_l,
-                                mic1_r: m1_r,
-                                mic2_l: m2_l,
-                                mic2_r: m2_r,
-                            });
                         }
-
-                        frame[0] = soft_limit(instru_l + m1_l + m2_l);
-                        frame[1] = soft_limit(instru_r + m1_r + m2_r);
-                    }
-
-                    // Report exact ringbuf occupancy so lyrics clock aligns to speaker output
-                    state
-                        .music_buffered_frames
-                        .store((music_cons.occupied_len() / 2) as u64, Ordering::Relaxed);
-
-                    // Publish lock-free telemetry once per audio callback (~375 Hz at 128 frames)
-                    state.mic_telemetry[0].store_dsp(mic1_dsp.telemetry(), mic1_params.muted);
-                    state.mic_telemetry[1].store_dsp(mic2_dsp.telemetry(), mic2_params.muted);
-                },
-                |err| {
-                    warn!("CoreAudio stream error: {err}");
-                },
-                None,
-            )
-            .map_err(|e| AudioError::Device(e.to_string()))?;
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| AudioError::Device(e.to_string()))?,
+            SampleFormat::I16 => device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        for frame in data.chunks_exact_mut(out_channels) {
+                            let (l, r) = render_next_stereo_frame();
+                            let to_i16 =
+                                |s: f32| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+                            if out_channels == 1 {
+                                frame[0] = to_i16(0.5 * (l + r));
+                            } else {
+                                frame[0] = to_i16(l);
+                                frame[1] = to_i16(r);
+                                for extra in frame.iter_mut().skip(2) {
+                                    *extra = 0;
+                                }
+                            }
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| AudioError::Device(e.to_string()))?,
+            SampleFormat::U16 => device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                        for frame in data.chunks_exact_mut(out_channels) {
+                            let (l, r) = render_next_stereo_frame();
+                            let to_u16 = |s: f32| {
+                                ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32).round() as u16
+                            };
+                            if out_channels == 1 {
+                                frame[0] = to_u16(0.5 * (l + r));
+                            } else {
+                                frame[0] = to_u16(l);
+                                frame[1] = to_u16(r);
+                                for extra in frame.iter_mut().skip(2) {
+                                    *extra = u16::MAX / 2;
+                                }
+                            }
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| AudioError::Device(e.to_string()))?,
+            other => {
+                return Err(AudioError::Device(format!(
+                    "Format de sortie CoreAudio non supporté : {other:?}"
+                )));
+            }
+        };
 
         stream
             .play()
@@ -440,11 +629,13 @@ impl AudioEngine {
         if let Ok(mut guard) = self.output_stream.lock() {
             *guard = Some(stream);
         }
+        if let Ok(mut name_guard) = self.active_output_device.lock() {
+            *name_guard = Some(resolved_name.clone());
+        }
 
         info!(
-            "CoreAudio stream started at {} Hz ({} frames buffer)",
-            MASTER_SAMPLE_RATE,
-            buffer_size.as_u32()
+            "CoreAudio output active on '{}' ({} Hz, {} ch)",
+            resolved_name, out_rate, out_channels
         );
         Ok(())
     }

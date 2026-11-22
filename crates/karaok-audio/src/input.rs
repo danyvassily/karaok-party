@@ -44,9 +44,10 @@ pub fn list_audio_input_devices() -> Vec<AudioInputDeviceInfo> {
     }
 
     out.sort_by(|a, b| {
-        b.is_iphone
-            .cmp(&a.is_iphone)
-            .then_with(|| b.is_default.cmp(&a.is_default))
+        // Prioritize default macOS / headset microphone first (not iPhone Continuity)
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| a.is_iphone.cmp(&b.is_iphone))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 

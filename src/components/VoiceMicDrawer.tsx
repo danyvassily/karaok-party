@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { Mic, MicOff, RefreshCw, Sliders, Smartphone, X } from "lucide-react";
+import { Headphones, Mic, MicOff, RefreshCw, Sliders, Speaker, X } from "lucide-react";
 import type {
   ActiveMicInputs,
   AudioInputDeviceInfo,
+  AudioOutputDeviceInfo,
   MicChannelId,
   MicTelemetry,
   ScaleType,
@@ -12,6 +13,8 @@ import type {
 
 interface VoiceMicDrawerProps {
   open: boolean;
+  outputDevices: AudioOutputDeviceInfo[];
+  activeOutputDevice: string | null;
   inputDevices: AudioInputDeviceInfo[];
   activeMicInputs: ActiveMicInputs;
   micError: string | null;
@@ -23,6 +26,7 @@ interface VoiceMicDrawerProps {
   bufferSize: string;
   onClose: () => void;
   onRefreshDevices: () => void;
+  onSelectOutputDevice: (deviceName: string | null) => void;
   onSelectInputDevice: (ch: MicChannelId, deviceName: string | null) => void;
   onSelectPreset: (ch: MicChannelId, preset: VocalPreset) => void;
   onUpdateParams: (ch: MicChannelId, params: VocalDspParams) => void;
@@ -32,13 +36,15 @@ interface VoiceMicDrawerProps {
 const PRESETS: { id: VocalPreset; label: string; desc: string }[] = [
   { id: "natural", label: "Naturel", desc: "Comp. légère · 0 % tune" },
   { id: "studio", label: "Studio", desc: "Chaleur · 85 ms · Plate" },
-  { id: "live", label: "Scène / Live", desc: "Grande salle · 50 ms" },
-  { id: "popStar", label: "Pop Star", desc: "Autotune 10 ms · Brillant" },
+  { id: "live", label: "Scène / Live", desc: "Grande salle · 45 ms" },
+  { id: "popStar", label: "Pop Star", desc: "Autotune 8 ms · Brillant" },
   { id: "expert", label: "Mode Expert", desc: "Tous les réglages DSP" },
 ];
 
 export function VoiceMicDrawer({
   open,
+  outputDevices,
+  activeOutputDevice,
   inputDevices,
   activeMicInputs,
   micError,
@@ -47,9 +53,9 @@ export function VoiceMicDrawer({
   mic1Params,
   mic2Params,
   latencyCalibrationMs,
-  bufferSize,
   onClose,
   onRefreshDevices,
+  onSelectOutputDevice,
   onSelectInputDevice,
   onSelectPreset,
   onUpdateParams,
@@ -61,29 +67,28 @@ export function VoiceMicDrawer({
 
   const activeParams = activeMic === "mic1" ? mic1Params : mic2Params;
   const isExpert = activeParams.preset === "expert";
-  const detectedIphone = inputDevices.find((d) => d.isIphone);
 
   const patchParam = <K extends keyof VocalDspParams>(key: K, value: VocalDspParams[K]) => {
     onUpdateParams(activeMic, { ...activeParams, [key]: value });
   };
 
   return (
-    <div className="fixed inset-y-0 right-0 z-40 flex w-[460px] max-w-[95vw] flex-col border-l border-white/10 bg-[#0D0F16]/98 shadow-2xl backdrop-blur-xl">
+    <div className="fixed inset-y-0 right-0 z-40 flex w-[470px] max-w-[95vw] flex-col border-l border-white/10 bg-[#0D0F16]/98 shadow-2xl backdrop-blur-xl">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-white/8 px-5 py-4">
         <div>
           <h2 className="text-sm font-bold text-slate-50">
-            Voix & Micros (iPhone connecté au Mac)
+            Réglages Audio, Casque Micro & Enceintes
           </h2>
           <p className="text-xs text-slate-400">
-            Connexion directe CoreAudio · 48 kHz ({bufferSize.replace("Frames", "")} éch.) · Sans QR Code
+            Routage CoreAudio indépendant : entrée casque micro → sortie enceintes
           </p>
         </div>
         <div className="flex items-center gap-1">
           <button
             type="button"
             onClick={onRefreshDevices}
-            title="Actualiser la liste des micros et iPhones connectés"
+            title="Actualiser les périphériques audio détectés sur le Mac"
             className="rounded-lg p-1.5 text-slate-400 hover:bg-white/10 hover:text-sky-300"
           >
             <RefreshCw className="h-4 w-4" />
@@ -91,7 +96,7 @@ export function VoiceMicDrawer({
           <button
             type="button"
             onClick={onClose}
-            aria-label="Fermer le tiroir micros"
+            aria-label="Fermer les réglages audio"
             className="rounded-lg p-1.5 text-slate-400 hover:bg-white/10 hover:text-slate-100"
           >
             <X className="h-4 w-4" />
@@ -100,84 +105,95 @@ export function VoiceMicDrawer({
       </div>
 
       <div className="flex-1 space-y-5 overflow-y-auto p-5">
-        {/* Direct Connected iPhone Status Banner */}
-        <section className="rounded-xl border border-sky-400/25 bg-sky-500/8 p-3.5">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-start gap-2.5">
-              <Smartphone className="mt-0.5 h-4 w-4 shrink-0 text-sky-400" />
-              <div className="space-y-0.5">
-                <p className="text-xs font-bold text-slate-100">
-                  {detectedIphone
-                    ? `iPhone détecté : ${detectedIphone.name}`
-                    : "Branchez ou approchez votre iPhone du Mac"}
-                </p>
-                <p className="text-[11px] leading-relaxed text-slate-300">
-                  {detectedIphone
-                    ? "Sélectionnez-le directement ci-dessous comme Micro 1 ou Micro 2 (latence native < 5 ms)."
-                    : "Activez « Appareil photo Continuité » sur l'iPhone ou branchez-le en USB au Mac, puis cliquez sur Actualiser."}
-                </p>
-              </div>
-            </div>
-            {detectedIphone && activeMicInputs.mic1Device !== detectedIphone.name && (
-              <button
-                type="button"
-                onClick={() => onSelectInputDevice("mic1", detectedIphone.name)}
-                className="shrink-0 rounded-lg bg-sky-400 px-3 py-1.5 text-xs font-bold text-slate-950 transition hover:bg-sky-300"
-              >
-                Connecter
-              </button>
-            )}
-          </div>
-        </section>
-
         {micError && (
           <p className="rounded-lg bg-rose-500/15 px-3 py-2 text-xs text-rose-300">
             {micError}
           </p>
         )}
 
-        {/* Helpful macOS privacy hint if mic is connected but receiving pure silence (-96 dB) */}
-        {((mic1Telemetry.connected && !mic1Params.muted && mic1Telemetry.vuDb <= -90) ||
-          (mic2Telemetry.connected && !mic2Params.muted && mic2Telemetry.vuDb <= -90)) && (
-          <p className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3.5 py-2.5 text-[11px] leading-relaxed text-amber-200">
-            <strong>Aucun son micro détecté (-96 dB) :</strong> parlez près du micro ou vérifiez que l'accès au micro est autorisé dans{" "}
-            <strong>Réglages Système → Confidentialité et sécurité → Micro</strong> (et déverrouillez votre iPhone si vous utilisez Continuité).
-          </p>
-        )}
+        {/* 1. Audio Output Selector (Speakers, Bluetooth, HDMI TV, Headphones) */}
+        <section className="space-y-2.5 rounded-2xl border border-emerald-400/25 bg-emerald-500/6 p-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Speaker className="h-4 w-4 text-emerald-400" />
+              <h3 className="text-xs font-bold text-slate-100">
+                Sortie Audio (Enceintes / TV / Casque)
+              </h3>
+            </div>
+            <span className="text-[10px] font-medium text-emerald-300">
+              {outputDevices.length} détectées
+            </span>
+          </div>
 
-        {/* Direct CoreAudio Input Cards: Mic 1 (Blue) & Mic 2 (Coral) */}
-        <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <MicInputCard
-            label="Micro 1 (Bleu)"
-            accent="sky"
-            selected={activeMic === "mic1"}
-            selectedDevice={activeMicInputs.mic1Device}
-            devices={inputDevices}
-            telemetry={mic1Telemetry}
-            params={mic1Params}
-            onSelectCard={() => setActiveMic("mic1")}
-            onChangeDevice={(name) => onSelectInputDevice("mic1", name)}
-            onToggleMute={() =>
-              onUpdateParams("mic1", { ...mic1Params, muted: !mic1Params.muted })
-            }
-          />
-          <MicInputCard
-            label="Micro 2 (Corail)"
-            accent="coral"
-            selected={activeMic === "mic2"}
-            selectedDevice={activeMicInputs.mic2Device}
-            devices={inputDevices}
-            telemetry={mic2Telemetry}
-            params={mic2Params}
-            onSelectCard={() => setActiveMic("mic2")}
-            onChangeDevice={(name) => onSelectInputDevice("mic2", name)}
-            onToggleMute={() =>
-              onUpdateParams("mic2", { ...mic2Params, muted: !mic2Params.muted })
-            }
-          />
+          <select
+            value={activeOutputDevice ?? ""}
+            onChange={(e) => onSelectOutputDevice(e.target.value || null)}
+            aria-label="Sortie audio principale"
+            className="w-full rounded-xl border border-white/12 bg-[#07080C] px-3 py-2.5 text-xs font-medium text-slate-100 focus:border-emerald-400 focus:outline-none"
+          >
+            {outputDevices.map((dev) => (
+              <option key={dev.name} value={dev.name}>
+                {dev.name} ({(dev.sampleRate / 1000).toFixed(1)} kHz · {dev.channels} ch)
+                {dev.isDefault ? " — Par défaut" : ""}
+              </option>
+            ))}
+          </select>
+
+          <p className="text-[11px] leading-relaxed text-slate-400">
+            Sélectionnez vos enceintes (ex. <strong>Haut-parleurs MacBook Pro</strong>, enceintes Bluetooth ou TV HDMI) pendant que votre <strong>casque micro</strong> sert uniquement d'entrée micro ci-dessous.
+          </p>
         </section>
 
-        {/* Vocal Presets for selected microphone */}
+        {/* 2. Audio Input Selectors: Mic 1 (Headset / Mac) & Mic 2 */}
+        <section className="space-y-2.5">
+          <div className="flex items-center gap-2">
+            <Headphones className="h-4 w-4 text-sky-400" />
+            <h3 className="text-xs font-bold text-slate-200">
+              Entrées Micro (Casque micro / Micro Mac)
+            </h3>
+          </div>
+
+          {((mic1Telemetry.connected && !mic1Params.muted && mic1Telemetry.vuDb <= -90) ||
+            (mic2Telemetry.connected && !mic2Params.muted && mic2Telemetry.vuDb <= -90)) && (
+            <p className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3.5 py-2.5 text-[11px] leading-relaxed text-amber-200">
+              <strong>Aucun signal micro détecté (-96 dB) :</strong> parlez dans votre casque micro ou vérifiez l'autorisation dans{" "}
+              <strong>Réglages Système → Confidentialité et sécurité → Micro</strong>.
+            </p>
+          )}
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <MicInputCard
+              label="Micro 1 (Casque / Principal)"
+              accent="sky"
+              selected={activeMic === "mic1"}
+              selectedDevice={activeMicInputs.mic1Device}
+              devices={inputDevices}
+              telemetry={mic1Telemetry}
+              params={mic1Params}
+              onSelectCard={() => setActiveMic("mic1")}
+              onChangeDevice={(name) => onSelectInputDevice("mic1", name)}
+              onToggleMute={() =>
+                onUpdateParams("mic1", { ...mic1Params, muted: !mic1Params.muted })
+              }
+            />
+            <MicInputCard
+              label="Micro 2 (Duo)"
+              accent="coral"
+              selected={activeMic === "mic2"}
+              selectedDevice={activeMicInputs.mic2Device}
+              devices={inputDevices}
+              telemetry={mic2Telemetry}
+              params={mic2Params}
+              onSelectCard={() => setActiveMic("mic2")}
+              onChangeDevice={(name) => onSelectInputDevice("mic2", name)}
+              onToggleMute={() =>
+                onUpdateParams("mic2", { ...mic2Params, muted: !mic2Params.muted })
+              }
+            />
+          </div>
+        </section>
+
+        {/* 3. Vocal Presets for selected microphone */}
         <section className="space-y-2.5">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-bold text-slate-200">
@@ -187,7 +203,7 @@ export function VoiceMicDrawer({
               </span>
             </h3>
             <span className="text-[11px] text-slate-400">
-              Autotune lié à la tonalité
+              Autotune + Réverbe en direct
             </span>
           </div>
 
@@ -215,7 +231,7 @@ export function VoiceMicDrawer({
           </div>
         </section>
 
-        {/* Expert DSP Controls (or quick Autotune / Reverb sliders) */}
+        {/* 4. Autotune & Reverb + Expert DSP Controls */}
         <section className="space-y-3 rounded-xl border border-white/8 bg-[#11131B] p-4">
           <div className="flex items-center justify-between">
             <span className="flex items-center gap-1.5 text-xs font-bold text-slate-100">
@@ -253,10 +269,10 @@ export function VoiceMicDrawer({
           </div>
 
           <ParamSlider
-            label="Volume Micro"
+            label="Volume Retour Voix (Micro)"
             value={Math.round(activeParams.gain * 100)}
             min={0}
-            max={200}
+            max={250}
             unit="%"
             onChange={(v) => patchParam("gain", v / 100)}
           />
@@ -294,13 +310,13 @@ export function VoiceMicDrawer({
                   onChange={(e) => patchParam("scale", e.target.value as ScaleType)}
                   className="rounded-lg border border-white/10 bg-[#07080C] px-2 py-1 text-xs text-slate-100"
                 >
-                  <option value="chromatic">Chromatique</option>
-                  <option value="major">Majeure (auto tonalité)</option>
-                  <option value="minor">Mineure (auto tonalité)</option>
+                  <option value="chromatic">Chromatique (universel)</option>
+                  <option value="major">Majeure</option>
+                  <option value="minor">Mineure</option>
                 </select>
               </div>
               <ParamSlider
-                label="Passe-Haut (Anti-manipulation)"
+                label="Passe-Haut (Anti-bruits graves)"
                 value={Math.round(activeParams.hpfHz)}
                 min={40}
                 max={160}
@@ -310,7 +326,7 @@ export function VoiceMicDrawer({
               <ParamSlider
                 label="Noise Gate (Anti-Larsen)"
                 value={Math.round(activeParams.gateThresholdDb)}
-                min={-65}
+                min={-70}
                 max={-18}
                 unit="dB"
                 onChange={(v) => patchParam("gateThresholdDb", v)}
@@ -351,11 +367,11 @@ export function VoiceMicDrawer({
           )}
         </section>
 
-        {/* Latency Calibration (0..250 ms) for Soundbars / Bluetooth */}
+        {/* 5. Latency Calibration (0..250 ms) for Soundbars / Bluetooth */}
         <section className="space-y-2 rounded-xl border border-white/8 bg-[#11131B] p-4">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-bold text-slate-100">
-              Calibration Latence (Barre de son / Bluetooth)
+              Calibration Latence (Enceinte Bluetooth / Barre de son)
             </h3>
             <span className="font-mono text-xs font-bold text-amber-300 tabular-nums">
               {latencyCalibrationMs} ms
@@ -371,7 +387,7 @@ export function VoiceMicDrawer({
             className="studio-slider w-full"
           />
           <p className="text-[11px] text-slate-400">
-            Compense le décalage audio entre la sortie Mac et les paroles affichées.
+            Compense le décalage audio entre vos enceintes et l'affichage des paroles.
           </p>
         </section>
       </div>
@@ -402,7 +418,7 @@ function MicInputCard({
   onChangeDevice: (deviceName: string | null) => void;
   onToggleMute: () => void;
 }) {
-  const vuPct = Math.max(0, Math.min(100, ((telemetry.vuDb + 60) / 60) * 100));
+  const vuPct = Math.max(0, Math.min(100, ((telemetry.vuDb + 65) / 65) * 100));
 
   return (
     <div
@@ -443,7 +459,7 @@ function MicInputCard({
         </button>
       </div>
 
-      {/* Native CoreAudio Device Selector */}
+      {/* Native CoreAudio Input Device Selector */}
       <select
         value={selectedDevice ?? ""}
         onClick={(e) => e.stopPropagation()}
@@ -454,7 +470,7 @@ function MicInputCard({
         <option value="">Désactivé</option>
         {devices.map((dev) => (
           <option key={dev.name} value={dev.name}>
-            {dev.isIphone ? `📱 ${dev.name}` : dev.name}
+            {dev.name} ({(dev.sampleRate / 1000).toFixed(1)} kHz)
           </option>
         ))}
       </select>
@@ -471,7 +487,7 @@ function MicInputCard({
         </div>
         <div className="flex items-center justify-between text-[10px] text-slate-400">
           <span className={telemetry.connected ? "font-semibold text-emerald-400" : ""}>
-            {telemetry.connected ? "Actif (CoreAudio)" : "Aucun micro"}
+            {telemetry.connected ? "Micro actif" : "Désactivé"}
           </span>
           <span className="font-mono tabular-nums">
             {telemetry.connected ? `${telemetry.vuDb.toFixed(0)} dB` : "--"}

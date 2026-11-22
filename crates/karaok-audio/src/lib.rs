@@ -19,7 +19,7 @@ pub mod stretcher;
 
 pub use atomics::AtomicEngineState;
 pub use decoder::{decode_audio_to_48khz_stereo, DecodedAudio};
-pub use engine::{AudioEngine, MicAudioProducer, MASTER_SAMPLE_RATE};
+pub use engine::{list_audio_output_devices, AudioEngine, MicAudioProducer, MASTER_SAMPLE_RATE};
 pub use error::{AudioError, AudioResult};
 pub use input::{list_audio_input_devices, NativeMicInputManager};
 pub use recorder::{mix_and_export_recording, RecordingHandle};

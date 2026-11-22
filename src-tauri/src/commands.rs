@@ -9,12 +9,14 @@ use karaok_ai::{
 };
 use karaok_audio::{
     decode_audio_to_48khz_stereo, list_audio_input_devices as enumerate_coreaudio_inputs,
-    mix_and_export_recording, AudioEngine, NativeMicInputManager,
+    list_audio_output_devices as enumerate_coreaudio_outputs, mix_and_export_recording,
+    AudioEngine, NativeMicInputManager,
 };
 use karaok_core::{
-    ActiveMicInputs, AudioInputDeviceInfo, DemucsModel, LoopRegion, LyricsDocument, LyricsFormat,
-    LyricsLine, LyricsSource, MicChannelId, MusicalKey, PlaybackTelemetry, QueueItem, QueueMode,
-    RecordingEntry, StemMix, StemStatus, Track, TrackSource, VocalDspParams, VocalPreset,
+    ActiveMicInputs, AudioInputDeviceInfo, AudioOutputDeviceInfo, AudioRoutingState, DemucsModel,
+    LoopRegion, LyricsDocument, LyricsFormat, LyricsLine, LyricsSource, MicChannelId, MusicalKey,
+    PlaybackTelemetry, QueueItem, QueueMode, RecordingEntry, StemMix, StemStatus, Track,
+    TrackSource, VocalDspParams, VocalPreset,
 };
 use karaok_db::KaraokDatabase;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -380,12 +382,39 @@ pub fn get_telemetry(state: State<'_, AppState>) -> PlaybackTelemetry {
 }
 
 // -----------------------------------------------------------------------------
-// Native macOS / Connected iPhone Microphones & Vocal DSP (No QR Code)
+// Native macOS Audio Routing (Headset / Mac Mics + Speaker Outputs) & Vocal DSP
 // -----------------------------------------------------------------------------
 
 #[tauri::command]
 pub fn list_audio_input_devices() -> Vec<AudioInputDeviceInfo> {
     enumerate_coreaudio_inputs()
+}
+
+#[tauri::command]
+pub fn list_audio_output_devices() -> Vec<AudioOutputDeviceInfo> {
+    enumerate_coreaudio_outputs()
+}
+
+#[tauri::command]
+pub fn select_audio_output_device(
+    device_name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AudioRoutingState, String> {
+    state
+        .audio
+        .select_output_device(device_name.as_deref())
+        .map_err(|e| e.to_string())?;
+    Ok(get_audio_routing_state(state))
+}
+
+#[tauri::command]
+pub fn get_audio_routing_state(state: State<'_, AppState>) -> AudioRoutingState {
+    let mics = state.mic_inputs.active_inputs();
+    AudioRoutingState {
+        output_device: state.audio.active_output_device(),
+        mic1_device: mics.mic1_device,
+        mic2_device: mics.mic2_device,
+    }
 }
 
 #[tauri::command]

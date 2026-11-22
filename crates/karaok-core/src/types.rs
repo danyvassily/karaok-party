@@ -206,7 +206,7 @@ pub struct StemMix {
 impl Default for StemMix {
     fn default() -> Self {
         Self {
-            vocals: 0.15,
+            vocals: 1.0,
             drums: 1.0,
             bass: 1.0,
             other: 1.0,
@@ -394,6 +394,25 @@ pub struct AudioInputDeviceInfo {
     pub is_iphone: bool,
     pub sample_rate: u32,
     pub channels: u16,
+}
+
+/// Native macOS CoreAudio output device discovered via `cpal` (speakers, HDMI TVs, Bluetooth, headphones).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioOutputDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Complete active CoreAudio routing state (selected output speakers + Mic 1 & Mic 2 inputs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioRoutingState {
+    pub output_device: Option<String>,
+    pub mic1_device: Option<String>,
+    pub mic2_device: Option<String>,
 }
 
 /// Currently bound CoreAudio input devices for Mic 1 and Mic 2.

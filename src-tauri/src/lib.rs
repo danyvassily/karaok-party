@@ -52,12 +52,16 @@ pub fn run() {
             let audio = Arc::new(audio_engine);
             let mic_inputs = Arc::new(NativeMicInputManager::new(audio.state(), mic_producers));
 
-            // Auto-connect any iPhone already connected to the Mac (Continuity / USB) to Mic 1!
+            // Auto-connect the user's connected headset / default macOS microphone (skipping iPhone Continuity)
             let devices = list_audio_input_devices();
-            if let Some(iphone) = devices.iter().find(|d| d.is_iphone) {
-                match mic_inputs.select_device(MicChannelId::Mic1, Some(&iphone.name)) {
-                    Ok(_) => info!("Auto-connected iPhone microphone '{}' to Mic 1", iphone.name),
-                    Err(err) => warn!("Could not auto-connect iPhone '{}': {err}", iphone.name),
+            let preferred_mic = devices
+                .iter()
+                .find(|d| !d.is_iphone && d.is_default)
+                .or_else(|| devices.iter().find(|d| !d.is_iphone));
+            if let Some(mic) = preferred_mic {
+                match mic_inputs.select_device(MicChannelId::Mic1, Some(&mic.name)) {
+                    Ok(_) => info!("Auto-connected headset/Mac microphone '{}' to Mic 1", mic.name),
+                    Err(err) => warn!("Could not auto-connect microphone '{}': {err}", mic.name),
                 }
             }
 
@@ -105,6 +109,9 @@ pub fn run() {
             commands::set_latency_calibration_ms,
             commands::get_telemetry,
             commands::list_audio_input_devices,
+            commands::list_audio_output_devices,
+            commands::select_audio_output_device,
+            commands::get_audio_routing_state,
             commands::select_mic_input_device,
             commands::get_active_mic_inputs,
             commands::set_mic_preset,

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { Activity, AlignLeft, PanelLeft, PanelLeftClose, Upload } from "lucide-react";
+import { Activity, AlignLeft, PanelLeft, PanelLeftClose, Settings2, Upload } from "lucide-react";
 import { LeftSidebar } from "./components/LeftSidebar";
 import { LyricsStage } from "./components/LyricsStage";
 import { RecordingReviewModal } from "./components/RecordingReviewModal";
@@ -18,6 +18,7 @@ import {
 import type {
   ActiveMicInputs,
   AudioInputDeviceInfo,
+  AudioOutputDeviceInfo,
   DemucsModel,
   LoopRegion,
   LyricsDocument,
@@ -45,6 +46,8 @@ export default function App() {
   const [activeTrack, setActiveTrack] = useState<Track | null>(null);
   const [lyrics, setLyrics] = useState<LyricsDocument | null>(null);
   const [telemetry, setTelemetry] = useState<PlaybackTelemetry>(DEFAULT_TELEMETRY);
+  const [outputDevices, setOutputDevices] = useState<AudioOutputDeviceInfo[]>([]);
+  const [activeOutputDevice, setActiveOutputDevice] = useState<string | null>(null);
   const [inputDevices, setInputDevices] = useState<AudioInputDeviceInfo[]>([]);
   const [activeMicInputs, setActiveMicInputs] = useState<ActiveMicInputs>({
     mic1Device: null,
@@ -75,20 +78,26 @@ export default function App() {
     setLyrics(doc);
   }, []);
 
-  const refreshInputDevices = useCallback(async () => {
-    const [devices, active] = await Promise.all([
+  const refreshAudioDevices = useCallback(async () => {
+    const [inputs, outputs, routing] = await Promise.all([
       karaokApi.listAudioInputDevices(),
-      karaokApi.getActiveMicInputs(),
+      karaokApi.listAudioOutputDevices(),
+      karaokApi.getAudioRoutingState(),
     ]);
-    setInputDevices(devices);
-    setActiveMicInputs(active);
+    setInputDevices(inputs);
+    setOutputDevices(outputs);
+    setActiveOutputDevice(routing.outputDevice);
+    setActiveMicInputs({
+      mic1Device: routing.mic1Device,
+      mic2Device: routing.mic2Device,
+    });
   }, []);
 
   // Bootstrap state & subscribe to 60Hz Tauri telemetry + backend events
   useEffect(() => {
     void refreshLibrary();
     void refreshQueue();
-    void refreshInputDevices();
+    void refreshAudioDevices();
     void karaokApi.getMicParams("mic1").then(setMic1Params);
     void karaokApi.getMicParams("mic2").then(setMic2Params);
 
@@ -132,7 +141,7 @@ export default function App() {
     return () => {
       unlisteners.forEach((fn) => fn());
     };
-  }, [refreshLibrary, refreshQueue, refreshInputDevices, loadLyricsForTrack]);
+  }, [refreshLibrary, refreshQueue, refreshAudioDevices, loadLyricsForTrack]);
 
   // Native macOS Drag & Drop audio file import via Tauri v2 webview
   useEffect(() => {
@@ -334,6 +343,16 @@ export default function App() {
     }
   };
 
+  const handleSelectOutputDevice = async (deviceName: string | null) => {
+    setMicError(null);
+    try {
+      const routing = await karaokApi.selectAudioOutputDevice(deviceName);
+      setActiveOutputDevice(routing.outputDevice);
+    } catch (err) {
+      setMicError(String(err));
+    }
+  };
+
   const handleSelectMicInput = async (ch: MicChannelId, deviceName: string | null) => {
     setMicError(null);
     try {
@@ -462,6 +481,24 @@ export default function App() {
             <AlignLeft className="h-3.5 w-3.5" />
             Sync Paroles
           </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setMicDrawerOpen((v) => {
+                if (!v) void refreshAudioDevices();
+                return !v;
+              });
+            }}
+            className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold transition ${
+              micDrawerOpen
+                ? "bg-emerald-400 text-slate-950"
+                : "border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
+            }`}
+          >
+            <Settings2 className="h-3.5 w-3.5" />
+            Réglages Audio
+          </button>
         </div>
       </header>
 
@@ -574,7 +611,7 @@ export default function App() {
         onToggleRecording={() => void handleToggleRecording()}
         onToggleMicDrawer={() => {
           setMicDrawerOpen((v) => {
-            if (!v) void refreshInputDevices();
+            if (!v) void refreshAudioDevices();
             return !v;
           });
         }}
@@ -584,9 +621,11 @@ export default function App() {
         }}
       />
 
-      {/* Discreet Slide-Over Voice & Connected Mac/iPhone Mic Drawer */}
+      {/* Audio Settings, Headset Mic & Speaker Output Routing Drawer */}
       <VoiceMicDrawer
         open={micDrawerOpen}
+        outputDevices={outputDevices}
+        activeOutputDevice={activeOutputDevice}
         inputDevices={inputDevices}
         activeMicInputs={activeMicInputs}
         micError={micError}
@@ -597,7 +636,8 @@ export default function App() {
         latencyCalibrationMs={telemetry.latencyCalibrationMs}
         bufferSize={telemetry.bufferSize}
         onClose={() => setMicDrawerOpen(false)}
-        onRefreshDevices={() => void refreshInputDevices()}
+        onRefreshDevices={() => void refreshAudioDevices()}
+        onSelectOutputDevice={(name) => void handleSelectOutputDevice(name)}
         onSelectInputDevice={(ch, name) => void handleSelectMicInput(ch, name)}
         onSelectPreset={handleSelectMicPreset}
         onUpdateParams={handleUpdateMicParams}

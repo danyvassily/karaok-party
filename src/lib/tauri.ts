@@ -3,6 +3,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ActiveMicInputs,
   AudioInputDeviceInfo,
+  AudioOutputDeviceInfo,
+  AudioRoutingState,
   DemucsModel,
   LoopRegion,
   LyricsDocument,
@@ -32,7 +34,7 @@ export const DEFAULT_TELEMETRY: PlaybackTelemetry = {
   transposeSemitones: 0,
   tempoPct: 100,
   effectiveKey: { root: "C", scale: "major" },
-  stemMix: { vocals: 0.15, drums: 1.0, bass: 1.0, other: 1.0, guitar: 1.0, piano: 1.0 },
+  stemMix: { vocals: 1.0, drums: 1.0, bass: 1.0, other: 1.0, guitar: 1.0, piano: 1.0 },
   abLoop: { enabled: false, startMs: 0, endMs: 0 },
   latencyCalibrationMs: 0,
   bufferSize: "Frames128",
@@ -193,6 +195,21 @@ export const karaokApi = {
     isTauriRuntime()
       ? invoke<AudioInputDeviceInfo[]>("list_audio_input_devices")
       : Promise.resolve([]),
+
+  listAudioOutputDevices: () =>
+    isTauriRuntime()
+      ? invoke<AudioOutputDeviceInfo[]>("list_audio_output_devices")
+      : Promise.resolve([]),
+
+  selectAudioOutputDevice: (deviceName: string | null) =>
+    isTauriRuntime()
+      ? invoke<AudioRoutingState>("select_audio_output_device", { deviceName })
+      : Promise.resolve({ outputDevice: null, mic1Device: null, mic2Device: null }),
+
+  getAudioRoutingState: () =>
+    isTauriRuntime()
+      ? invoke<AudioRoutingState>("get_audio_routing_state")
+      : Promise.resolve({ outputDevice: null, mic1Device: null, mic2Device: null }),
 
   selectMicInputDevice: (channel: MicChannelId, deviceName: string | null) =>
     isTauriRuntime()

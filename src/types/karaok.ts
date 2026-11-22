@@ -147,6 +147,19 @@ export interface AudioInputDeviceInfo {
   channels: number;
 }
 
+export interface AudioOutputDeviceInfo {
+  name: string;
+  isDefault: boolean;
+  sampleRate: number;
+  channels: number;
+}
+
+export interface AudioRoutingState {
+  outputDevice: string | null;
+  mic1Device: string | null;
+  mic2Device: string | null;
+}
+
 export interface ActiveMicInputs {
   mic1Device: string | null;
   mic2Device: string | null;
