@@ -21,6 +21,9 @@ pub use atomics::AtomicEngineState;
 pub use decoder::{decode_audio_to_48khz_stereo, DecodedAudio};
 pub use engine::{list_audio_output_devices, AudioEngine, MicAudioProducer, MASTER_SAMPLE_RATE};
 pub use error::{AudioError, AudioResult};
-pub use input::{list_audio_input_devices, NativeMicInputManager};
+pub use input::{
+    ensure_microphone_permission, is_built_in_macbook_mic, is_macbook_clamshell_closed,
+    list_audio_input_devices, NativeMicInputManager,
+};
 pub use recorder::{mix_and_export_recording, RecordingHandle};
 pub use stretcher::PitchTempoProcessor;

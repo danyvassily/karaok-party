@@ -17,3 +17,6 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1"

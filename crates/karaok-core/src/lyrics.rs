@@ -227,7 +227,7 @@ impl LyricsDocument {
 
     /// Applies a global synchronization shift (`+100 ms` or `-100 ms` via `]` and `[`).
     pub fn shift_offset(&mut self, delta_ms: i64) {
-        self.offset_ms = (self.offset_ms + delta_ms).clamp(-30_000, 30_000);
+        self.offset_ms = (self.offset_ms + delta_ms).clamp(-120_000, 120_000);
     }
 
     /// Computes the active line, active word, and 3-dot countdown for `position_ms`.
@@ -451,5 +451,9 @@ mod tests {
         doc.shift_offset(100);
         doc.shift_offset(-200);
         assert_eq!(doc.offset_ms, -100);
+        doc.shift_offset(-200_000);
+        assert_eq!(doc.offset_ms, -120_000);
+        doc.shift_offset(100);
+        assert_eq!(doc.offset_ms, -119_900);
     }
 }

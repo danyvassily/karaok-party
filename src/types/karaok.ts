@@ -158,6 +158,7 @@ export interface AudioRoutingState {
   outputDevice: string | null;
   mic1Device: string | null;
   mic2Device: string | null;
+  clamshellClosed?: boolean;
 }
 
 export interface ActiveMicInputs {

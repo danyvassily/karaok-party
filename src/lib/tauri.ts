@@ -70,73 +70,73 @@ export function defaultVocalParams(preset: VocalPreset = "studio"): VocalDspPara
       return {
         preset,
         muted: false,
-        gain: 1.0,
+        gain: 2.2,
         hpfHz: 80,
-        gateThresholdDb: -48,
+        gateThresholdDb: -68,
         compRatio: 2.2,
-        compThresholdDb: -16,
+        compThresholdDb: -22,
         autotuneEnabled: false,
         scale: "chromatic",
         retuneSpeedMs: 120,
         autotuneMix: 0,
-        reverbRoomSize: 0.35,
-        reverbDamping: 0.65,
-        reverbWet: 0.12,
-        presenceDb: 0.5,
+        reverbRoomSize: 0.45,
+        reverbDamping: 0.55,
+        reverbWet: 0.22,
+        presenceDb: 1.5,
       };
     case "live":
       return {
         preset,
         muted: false,
-        gain: 1.15,
-        hpfHz: 90,
-        gateThresholdDb: -42,
-        compRatio: 3.2,
-        compThresholdDb: -19,
+        gain: 2.7,
+        hpfHz: 85,
+        gateThresholdDb: -64,
+        compRatio: 3.5,
+        compThresholdDb: -24,
         autotuneEnabled: true,
-        scale: "major",
-        retuneSpeedMs: 50,
-        autotuneMix: 0.65,
-        reverbRoomSize: 0.78,
-        reverbDamping: 0.35,
-        reverbWet: 0.4,
-        presenceDb: 2.2,
+        scale: "chromatic",
+        retuneSpeedMs: 45,
+        autotuneMix: 1.0,
+        reverbRoomSize: 0.84,
+        reverbDamping: 0.28,
+        reverbWet: 0.55,
+        presenceDb: 3.0,
       };
     case "popStar":
       return {
         preset,
         muted: false,
-        gain: 1.2,
+        gain: 2.8,
         hpfHz: 85,
-        gateThresholdDb: -44,
+        gateThresholdDb: -65,
         compRatio: 4.0,
-        compThresholdDb: -20,
+        compThresholdDb: -25,
         autotuneEnabled: true,
-        scale: "major",
-        retuneSpeedMs: 10,
-        autotuneMix: 0.95,
-        reverbRoomSize: 0.62,
-        reverbDamping: 0.3,
-        reverbWet: 0.3,
-        presenceDb: 3.5,
+        scale: "chromatic",
+        retuneSpeedMs: 8,
+        autotuneMix: 1.0,
+        reverbRoomSize: 0.68,
+        reverbDamping: 0.28,
+        reverbWet: 0.45,
+        presenceDb: 3.8,
       };
     default:
       return {
         preset,
         muted: false,
-        gain: 1.1,
+        gain: 2.5,
         hpfHz: 80,
-        gateThresholdDb: -45,
-        compRatio: 3.0,
-        compThresholdDb: -18,
+        gateThresholdDb: -66,
+        compRatio: 3.2,
+        compThresholdDb: -24,
         autotuneEnabled: true,
-        scale: "major",
-        retuneSpeedMs: 85,
-        autotuneMix: 0.55,
-        reverbRoomSize: 0.55,
-        reverbDamping: 0.45,
-        reverbWet: 0.24,
-        presenceDb: 1.8,
+        scale: "chromatic",
+        retuneSpeedMs: 80,
+        autotuneMix: 1.0,
+        reverbRoomSize: 0.64,
+        reverbDamping: 0.38,
+        reverbWet: 0.4,
+        presenceDb: 2.8,
       };
   }
 }
@@ -209,7 +209,15 @@ export const karaokApi = {
   getAudioRoutingState: () =>
     isTauriRuntime()
       ? invoke<AudioRoutingState>("get_audio_routing_state")
-      : Promise.resolve({ outputDevice: null, mic1Device: null, mic2Device: null }),
+      : Promise.resolve({
+          outputDevice: null,
+          mic1Device: null,
+          mic2Device: null,
+          clamshellClosed: false,
+        }),
+
+  playOutputTestTone: () =>
+    isTauriRuntime() ? invoke<void>("play_output_test_tone") : Promise.resolve(),
 
   selectMicInputDevice: (channel: MicChannelId, deviceName: string | null) =>
     isTauriRuntime()
@@ -260,6 +268,15 @@ export const karaokApi = {
 
   autoAlignLyricsWhisper: (trackId: string, plainLyrics: string) =>
     invoke<LyricsDocument>("auto_align_lyrics_whisper", { trackId, plainLyrics }),
+
+  realignLyricsVocalOnset: (trackId: string) =>
+    invoke<LyricsDocument>("realign_lyrics_vocal_onset", { trackId }),
+
+  setLyricsStartHere: (trackId: string, positionMs: number) =>
+    invoke<LyricsDocument>("set_lyrics_start_here", {
+      trackId,
+      positionMs: Math.max(0, Math.floor(positionMs)),
+    }),
 
   shiftLyricsOffset: (trackId: string, deltaMs: number) =>
     invoke<LyricsDocument>("shift_lyrics_offset", { trackId, deltaMs }),
@@ -316,4 +333,9 @@ export const karaokApi = {
 
   onQueueUpdated: (cb: () => void): Promise<UnlistenFn> =>
     isTauriRuntime() ? listen("queue-updated", () => cb()) : Promise.resolve(() => {}),
+
+  onAudioRoutingUpdated: (cb: () => void): Promise<UnlistenFn> =>
+    isTauriRuntime()
+      ? listen("audio-routing-updated", () => cb())
+      : Promise.resolve(() => {}),
 };

@@ -51,7 +51,7 @@ impl NoiseGate {
             }
         }
 
-        let target_gain = if self.is_open { 1.0 } else { 0.08 }; // Gentle -22dB floor keeps quiet vocals natural
+        let target_gain = if self.is_open { 1.0 } else { 0.14 }; // Gentle -17dB idle floor keeps quiet Bluetooth headsets audible while stopping Larsen
         let coeff = if target_gain > self.gain {
             self.attack_coeff
         } else {

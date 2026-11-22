@@ -48,6 +48,7 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<PlaybackTelemetry>(DEFAULT_TELEMETRY);
   const [outputDevices, setOutputDevices] = useState<AudioOutputDeviceInfo[]>([]);
   const [activeOutputDevice, setActiveOutputDevice] = useState<string | null>(null);
+  const [clamshellClosed, setClamshellClosed] = useState(false);
   const [inputDevices, setInputDevices] = useState<AudioInputDeviceInfo[]>([]);
   const [activeMicInputs, setActiveMicInputs] = useState<ActiveMicInputs>({
     mic1Device: null,
@@ -87,6 +88,7 @@ export default function App() {
     setInputDevices(inputs);
     setOutputDevices(outputs);
     setActiveOutputDevice(routing.outputDevice);
+    setClamshellClosed(Boolean(routing.clamshellClosed));
     setActiveMicInputs({
       mic1Device: routing.mic1Device,
       mic2Device: routing.mic2Device,
@@ -137,6 +139,9 @@ export default function App() {
       })
       .then((u) => unlisteners.push(u));
     void karaokApi.onQueueUpdated(() => void refreshQueue()).then((u) => unlisteners.push(u));
+    void karaokApi
+      .onAudioRoutingUpdated(() => void refreshAudioDevices())
+      .then((u) => unlisteners.push(u));
 
     return () => {
       unlisteners.forEach((fn) => fn());
@@ -594,6 +599,18 @@ export default function App() {
                 await karaokApi.openGoogleLyricsSearch(activeTrack.title, activeTrack.artist);
               }}
               onSavePastedLyrics={handleSavePlainLyrics}
+              onRealignVocalOnset={async () => {
+                if (!activeTrack) return;
+                const doc = await karaokApi.realignLyricsVocalOnset(activeTrack.id);
+                setLyrics(doc);
+                await refreshLibrary();
+              }}
+              onSetStartHere={async (posMs) => {
+                if (!activeTrack) return;
+                const doc = await karaokApi.setLyricsStartHere(activeTrack.id, posMs);
+                setLyrics(doc);
+              }}
+              onSeekMs={(ms) => void karaokApi.seekMs(ms)}
             />
           )}
         </main>
@@ -628,6 +645,7 @@ export default function App() {
         open={micDrawerOpen}
         outputDevices={outputDevices}
         activeOutputDevice={activeOutputDevice}
+        clamshellClosed={clamshellClosed}
         inputDevices={inputDevices}
         activeMicInputs={activeMicInputs}
         micError={micError}
@@ -639,6 +657,7 @@ export default function App() {
         bufferSize={telemetry.bufferSize}
         onClose={() => setMicDrawerOpen(false)}
         onRefreshDevices={() => void refreshAudioDevices()}
+        onTestOutputTone={() => void karaokApi.playOutputTestTone()}
         onSelectOutputDevice={(name) => void handleSelectOutputDevice(name)}
         onSelectInputDevice={(ch, name) => void handleSelectMicInput(ch, name)}
         onSelectPreset={handleSelectMicPreset}

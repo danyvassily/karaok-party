@@ -130,7 +130,7 @@ impl AtomicVocalParams {
     }
 
     pub fn set_gain(&self, gain: f32) {
-        store_f32(&self.gain, gain.clamp(0.0, 2.5));
+        store_f32(&self.gain, gain.clamp(0.0, 4.0));
     }
 }
 
@@ -224,6 +224,7 @@ pub struct AtomicEngineState {
     pub loop_end_ms: AtomicU64,
     pub latency_calibration_ms: AtomicU32,
     pub buffer_size: AtomicU32,
+    pub test_tone_frames: AtomicU32,
     pub mic_params: [AtomicVocalParams; 2],
     pub mic_telemetry: [AtomicMicTelemetry; 2],
 }
@@ -254,6 +255,7 @@ impl Default for AtomicEngineState {
             loop_end_ms: AtomicU64::new(0),
             latency_calibration_ms: AtomicU32::new(0),
             buffer_size: AtomicU32::new(AudioBufferSize::Frames128.as_u32()),
+            test_tone_frames: AtomicU32::new(0),
             mic_params: [
                 AtomicVocalParams::new(VocalDspParams::from_preset(VocalPreset::Studio)),
                 AtomicVocalParams::new(VocalDspParams::from_preset(VocalPreset::Studio)),

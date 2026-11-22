@@ -82,6 +82,20 @@ pub fn clean_search_metadata(title: &str, artist: &str) -> (String, String) {
                 }
             }
         }
+        // Strip trailing unparenthesized featuring clauses (e.g. "Stay ft. Mikky Ekko" -> "Stay")
+        // Search ASCII case-insensitively on raw UTF-8 bytes so multi-byte uppercase chars (e.g. 'İ')
+        // never shift byte offsets when calling `truncate`.
+        for marker in [" feat. ", " ft. ", " featuring ", " feat ", " ft "] {
+            let m = marker.as_bytes();
+            if let Some(pos) = s
+                .as_bytes()
+                .windows(m.len())
+                .position(|w| w.eq_ignore_ascii_case(m))
+            {
+                s.truncate(pos);
+                break;
+            }
+        }
         // Strip common channel suffixes
         for suffix in [" - Topic", " VEVO", "VEVO", " Official", " Officiel"] {
             if let Some(stripped) = s.strip_suffix(suffix) {
@@ -162,7 +176,9 @@ impl LrclibClient {
     ) -> Result<LyricsDocument, LrclibError> {
         let (clean_title, clean_artist) = clean_search_metadata(title, artist);
 
-        // 1. LRCLIB exact match (/api/get)
+        let mut best_plain_fallback: Option<LyricsDocument> = None;
+
+        // 1. LRCLIB exact match (/api/get): accept immediately only when time-synced `.lrc` exists
         if !clean_title.is_empty() && !clean_artist.is_empty() {
             let mut params = vec![
                 ("track_name", clean_title.clone()),
@@ -180,8 +196,16 @@ impl LrclibClient {
             {
                 if resp.status().is_success() {
                     if let Ok(record) = resp.json::<LrclibRecord>().await {
-                        if let Some(doc) = record_to_lyrics_doc(&record) {
-                            return Ok(doc);
+                        if record
+                            .synced_lyrics
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                        {
+                            if let Some(doc) = record_to_lyrics_doc(&record) {
+                                return Ok(doc);
+                            }
+                        } else if best_plain_fallback.is_none() {
+                            best_plain_fallback = record_to_lyrics_doc(&record);
                         }
                     }
                 }
@@ -189,7 +213,6 @@ impl LrclibClient {
         }
 
         // 2. LRCLIB fuzzy search (artist + title, then title-only)
-        let mut best_plain_fallback: Option<LyricsDocument> = None;
         let queries = if !clean_artist.is_empty()
             && !clean_artist.eq_ignore_ascii_case("artiste inconnu")
             && !clean_artist.eq_ignore_ascii_case("unknown artist")
@@ -317,6 +340,14 @@ mod tests {
         let (t2, a2) = clean_search_metadata("Formidable (Clip Officiel)", "StromaeVEVO");
         assert_eq!(a2, "Stromae");
         assert_eq!(t2, "Formidable");
+
+        let (t3, a3) = clean_search_metadata("Stay (Lyrics) ft. Mikky Ekko", "Rihanna");
+        assert_eq!(a3, "Rihanna");
+        assert_eq!(t3, "Stay");
+
+        let (t4, a4) = clean_search_metadata("İzmir ft. Someone", "İstanbul");
+        assert_eq!(a4, "İstanbul");
+        assert_eq!(t4, "İzmir");
     }
 
     #[test]

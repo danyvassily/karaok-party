@@ -1,132 +1,207 @@
 use std::sync::{Arc, Mutex};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream, StreamConfig};
 use karaok_core::{ActiveMicInputs, AudioInputDeviceInfo, MicChannelId};
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(not(target_os = "macos"))]
+use tracing::warn;
 
 use crate::atomics::AtomicEngineState;
 use crate::engine::{MicAudioProducer, MASTER_SAMPLE_RATE};
 use crate::error::{AudioError, AudioResult};
 
-fn cpal_device_name(dev: &cpal::Device) -> Option<String> {
-    dev.description()
-        .ok()
-        .map(|d| d.name().to_string())
-        .filter(|s| !s.trim().is_empty())
+#[cfg(target_os = "macos")]
+mod macos_av {
+    use std::ffi::{c_char, c_void, CStr, CString};
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct KpAvDeviceInfo {
+        pub name: [c_char; 256],
+        pub sample_rate: u32,
+        pub channels: u16,
+        pub is_default: bool,
+        pub is_iphone: bool,
+    }
+
+    pub type KpAvAudioCallback = extern "C" fn(
+        samples: *const f32,
+        frames: usize,
+        sample_rate: u32,
+        channels: u16,
+        user_ctx: *mut c_void,
+    );
+
+    unsafe extern "C" {
+        pub fn kp_av_is_clamshell_closed() -> bool;
+        pub fn kp_av_mic_auth_status(request_if_needed: bool) -> i32;
+        pub fn kp_av_list_input_devices(out_buf: *mut KpAvDeviceInfo, max_count: usize) -> usize;
+        pub fn kp_av_start_capture(
+            target_name: *const c_char,
+            callback: KpAvAudioCallback,
+            user_ctx: *mut c_void,
+            out_sample_rate: *mut u32,
+            out_channels: *mut u16,
+            err_buf: *mut c_char,
+            err_buf_len: usize,
+        ) -> *mut c_void;
+        pub fn kp_av_stop_capture(handle: *mut c_void);
+    }
+
+    pub fn cstr_to_string(buf: &[c_char]) -> String {
+        // SAFETY: `kp_av_list_input_devices` always NUL-terminates `info.name` via `strlcpy`.
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn make_cstring(s: &str) -> Result<CString, String> {
+        CString::new(s).map_err(|_| "Nom de périphérique audio invalide".to_string())
+    }
 }
 
-fn resolve_input_config(dev: &cpal::Device) -> Option<cpal::SupportedStreamConfig> {
-    if let Ok(cfg) = dev.default_input_config() {
-        if cfg.sample_rate() > 0 && cfg.channels() > 0 {
-            return Some(cfg);
-        }
-    }
-    let ranges = dev.supported_input_configs().ok()?;
-    let mut best: Option<cpal::SupportedStreamConfig> = None;
-    for r in ranges {
-        if r.channels() == 0 {
-            continue;
-        }
-        let target_sr = if r.min_sample_rate() <= MASTER_SAMPLE_RATE
-            && r.max_sample_rate() >= MASTER_SAMPLE_RATE
-        {
-            MASTER_SAMPLE_RATE
-        } else {
-            r.max_sample_rate()
-        };
-        if target_sr == 0 {
-            continue;
-        }
-        let cand = r.with_sample_rate(target_sr);
-        let better = match &best {
-            None => true,
-            Some(prev) => {
-                (cand.sample_format() == SampleFormat::F32
-                    && prev.sample_format() != SampleFormat::F32)
-                    || cand.sample_rate() > prev.sample_rate()
-            }
-        };
-        if better {
-            best = Some(cand);
-        }
-    }
-    best
+/// Returns `true` if `name` refers to a built-in MacBook internal microphone across macOS locales
+/// (English `MacBook Pro Microphone` / `Built-in Microphone`, French `Micro MacBook Pro`, German `MacBook-Mikrofon`, etc.).
+pub fn is_built_in_macbook_mic(name: &str) -> bool {
+    let l = name.to_lowercase();
+    l.contains("built-in")
+        || l.contains("interne")
+        || (l.contains("macbook")
+            && (l.contains("micro") || l.contains("mikro") || l.contains("mic")))
 }
 
-/// Lists all CoreAudio input devices currently visible to macOS (headset microphones,
-/// built-in MacBook microphone, USB/Bluetooth audio interfaces, etc.), sorted with
-/// the macOS default input first.
+/// Returns `true` if the MacBook lid is currently closed (clamshell mode, which
+/// hardware-mutes `Micro MacBook Pro` on Apple Silicon Macs).
+pub fn is_macbook_clamshell_closed() -> bool {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        macos_av::kp_av_is_clamshell_closed()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Requests macOS microphone TCC permission if not yet determined, returning the OS status code
+/// (`3` = authorized, `2` = denied, `1` = restricted, `0` = not determined).
+pub fn ensure_microphone_permission(prompt_if_needed: bool) -> i32 {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        macos_av::kp_av_mic_auth_status(prompt_if_needed)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = prompt_if_needed;
+        3
+    }
+}
+
+/// Lists all audio input devices currently visible to macOS AVFoundation (Bluetooth headsets
+/// like Nothing Headphone (a), Continuity/USB iPhone Microphone, USB headsets, built-in mic, etc.).
 pub fn list_audio_input_devices() -> Vec<AudioInputDeviceInfo> {
-    let host = cpal::default_host();
-    let default_name = host
-        .default_input_device()
-        .and_then(|d| cpal_device_name(&d));
+    #[cfg(target_os = "macos")]
+    {
+        let mut raw = [macos_av::KpAvDeviceInfo {
+            name: [0; 256],
+            sample_rate: MASTER_SAMPLE_RATE,
+            channels: 1,
+            is_default: false,
+            is_iphone: false,
+        }; 32];
 
-    let Ok(devices) = host.input_devices() else {
-        return Vec::new();
-    };
-
-    let mut out: Vec<AudioInputDeviceInfo> = Vec::new();
-    for dev in devices {
-        let Some(name) = cpal_device_name(&dev) else {
-            continue;
-        };
-        let cfg = resolve_input_config(&dev);
-        let sample_rate = cfg.as_ref().map_or(MASTER_SAMPLE_RATE, |c| c.sample_rate());
-        let channels = cfg.as_ref().map_or(1, |c| c.channels());
-        let lower = name.to_ascii_lowercase();
-        let is_iphone = lower.contains("iphone") || lower.contains("continuity");
-        let is_default = default_name.as_deref() == Some(name.as_str());
-
-        if let Some(existing) = out.iter_mut().find(|d| d.name == name) {
-            existing.sample_rate = existing.sample_rate.max(sample_rate);
-            existing.channels = existing.channels.max(channels);
-            existing.is_default |= is_default;
-            continue;
+        let raw_count =
+            unsafe { macos_av::kp_av_list_input_devices(raw.as_mut_ptr(), raw.len()) };
+        let count = raw_count.min(raw.len());
+        let mut out: Vec<AudioInputDeviceInfo> = Vec::with_capacity(count);
+        for item in &raw[..count] {
+            let name = macos_av::cstr_to_string(&item.name);
+            if name.trim().is_empty() {
+                continue;
+            }
+            if let Some(existing) = out.iter_mut().find(|d| d.name == name) {
+                existing.sample_rate = existing.sample_rate.max(item.sample_rate);
+                existing.channels = existing.channels.max(item.channels.max(1));
+                existing.is_default |= item.is_default;
+                existing.is_iphone |= item.is_iphone;
+                continue;
+            }
+            out.push(AudioInputDeviceInfo {
+                name,
+                is_default: item.is_default,
+                is_iphone: item.is_iphone,
+                sample_rate: item.sample_rate.max(8000),
+                channels: item.channels.max(1),
+            });
         }
 
-        out.push(AudioInputDeviceInfo {
-            name,
-            is_default,
-            is_iphone,
-            sample_rate,
-            channels,
+        out.sort_by(|a, b| {
+            b.is_default
+                .cmp(&a.is_default)
+                .then_with(|| a.is_iphone.cmp(&b.is_iphone))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
+        out
     }
 
-    out.sort_by(|a, b| {
-        // Prioritize default macOS / headset microphone first (not iPhone Continuity)
-        b.is_default
-            .cmp(&a.is_default)
-            .then_with(|| a.is_iphone.cmp(&b.is_iphone))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-
-    out
+    #[cfg(not(target_os = "macos"))]
+    {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        let Ok(devices) = host.input_devices() else {
+            return Vec::new();
+        };
+        devices
+            .filter_map(|d| {
+                let name = d.description().ok()?.name().to_string();
+                let cfg = d.default_input_config().ok()?;
+                Some(AudioInputDeviceInfo {
+                    name,
+                    is_default: false,
+                    is_iphone: false,
+                    sample_rate: cfg.sample_rate(),
+                    channels: cfg.channels(),
+                })
+            })
+            .collect()
+    }
 }
 
-/// Zero-allocation linear resampler inside the CoreAudio input callback converting
-/// arbitrary device sample rates (e.g. 44.1 kHz Continuity / 16 kHz BT) cleanly to 48 kHz mono.
-struct InlineMonoResampler {
+/// Zero-allocation linear resampler inside the audio input callback converting
+/// arbitrary device sample rates (e.g. 16 kHz Bluetooth HFP / 44.1 kHz / 48 kHz) cleanly to 48 kHz mono.
+pub struct InlineMonoResampler {
+    in_rate: u32,
+    out_rate: u32,
     ratio: f64, // input_sr / output_sr
     frac: f64,
     prev_sample: f32,
 }
 
 impl InlineMonoResampler {
-    fn new(in_rate: u32, out_rate: u32) -> Self {
+    pub fn new(in_rate: u32, out_rate: u32) -> Self {
+        let in_r = in_rate.max(8000);
+        let out_r = out_rate.max(8000);
         Self {
-            ratio: (in_rate.max(8000) as f64) / (out_rate.max(8000) as f64),
+            in_rate: in_r,
+            out_rate: out_r,
+            ratio: (in_r as f64) / (out_r as f64),
             frac: 0.0,
             prev_sample: 0.0,
+        }
+    }
+
+    #[inline]
+    pub fn set_input_rate(&mut self, in_rate: u32) {
+        let in_r = in_rate.max(8000);
+        if in_r != self.in_rate {
+            self.in_rate = in_r;
+            self.ratio = (in_r as f64) / (self.out_rate as f64);
         }
     }
 
     /// Pushes one mono input sample and emits 0..N resampled 48 kHz samples directly into `prod`.
     /// Strictly zero heap allocation.
     #[inline]
-    fn push_and_emit(&mut self, sample: f32, prod: &mut MicAudioProducer) {
+    pub fn push_and_emit(&mut self, sample: f32, prod: &mut MicAudioProducer) {
         let clean = if sample.is_finite() { sample } else { 0.0 };
         if (self.ratio - 1.0).abs() < 1e-6 {
             let buf = [clean];
@@ -146,20 +221,91 @@ impl InlineMonoResampler {
     }
 }
 
+#[cfg(target_os = "macos")]
+struct AvCaptureCallbackCtx {
+    producer: Arc<Mutex<MicAudioProducer>>,
+    resampler: InlineMonoResampler,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_av_audio_samples(
+    samples: *const f32,
+    frames: usize,
+    sample_rate: u32,
+    channels: u16,
+    user_ctx: *mut std::ffi::c_void,
+) {
+    // STRICT REAL-TIME INPUT CALLBACK: zero allocations, zero syscalls, zero blocking locks.
+    if samples.is_null() || frames == 0 || user_ctx.is_null() {
+        return;
+    }
+    let ch = (channels as usize).max(1);
+    let total_floats = frames.saturating_mul(ch);
+    // SAFETY: `av_mic.m` passes a valid `frames * ch` aligned `f32` buffer and keeps `user_ctx`
+    // alive until `kp_av_stop_capture` completes its `dispatch_sync` barrier.
+    let data = unsafe { std::slice::from_raw_parts(samples, total_floats) };
+    let ctx = unsafe { &mut *(user_ctx as *mut AvCaptureCallbackCtx) };
+    ctx.resampler.set_input_rate(sample_rate);
+
+    if let Ok(mut prod) = ctx.producer.try_lock() {
+        if ch == 1 {
+            for &s in data {
+                ctx.resampler.push_and_emit(s, &mut prod);
+            }
+        } else {
+            let inv_ch = 1.0 / ch as f32;
+            for frame in data.chunks_exact(ch) {
+                let mut sum = 0.0_f32;
+                for &s in frame {
+                    sum += s;
+                }
+                ctx.resampler.push_and_emit(sum * inv_ch, &mut prod);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct AvCaptureStream {
+    handle: *mut std::ffi::c_void,
+    ctx_ptr: *mut AvCaptureCallbackCtx,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for AvCaptureStream {}
+
+#[cfg(target_os = "macos")]
+impl Drop for AvCaptureStream {
+    fn drop(&mut self) {
+        // 1. Stop session & barrier-drain the serial dispatch queue BEFORE freeing `ctx_ptr`.
+        if !self.handle.is_null() {
+            unsafe { macos_av::kp_av_stop_capture(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+        if !self.ctx_ptr.is_null() {
+            unsafe { drop(Box::from_raw(self.ctx_ptr)) };
+            self.ctx_ptr = std::ptr::null_mut();
+        }
+    }
+}
+
 struct ActiveInputSlot {
     device_name: Option<String>,
-    stream: Option<Stream>,
+    #[cfg(target_os = "macos")]
+    stream: Option<AvCaptureStream>,
+    #[cfg(not(target_os = "macos"))]
+    stream: Option<cpal::Stream>,
     producer: Arc<Mutex<MicAudioProducer>>,
 }
 
-/// Manages native CoreAudio input streams for Mic 1 & Mic 2 (direct Mac/iPhone connection,
-/// zero QR code or local HTTPS server required).
+/// Manages native low-latency microphone capture streams for Mic 1 & Mic 2 via Apple `AVFoundation`
+/// (`AVCaptureSession`), supporting Bluetooth headsets, USB mics, Continuity iPhone Mic, and Mac mics.
 pub struct NativeMicInputManager {
     state: Arc<AtomicEngineState>,
     slots: [Mutex<ActiveInputSlot>; 2],
 }
 
-// Safety: `cpal::Stream` is guarded by Mutex and only created/dropped on control threads.
+// Safety: active streams are guarded by `Mutex` and stopped/dropped strictly on control threads.
 unsafe impl Send for NativeMicInputManager {}
 unsafe impl Sync for NativeMicInputManager {}
 
@@ -183,8 +329,7 @@ impl NativeMicInputManager {
         }
     }
 
-    /// Connects `channel` (`Mic1` or `Mic2`) directly to the named macOS CoreAudio input device
-    /// (e.g. an iPhone connected to the Mac via Continuity / USB), or disconnects when `device_name` is `None`.
+    /// Connects `channel` (`Mic1` or `Mic2`) to the named microphone device, or disconnects when `None`.
     pub fn select_device(
         &self,
         channel: MicChannelId,
@@ -203,119 +348,121 @@ impl NativeMicInputManager {
             .store_network(false, 0.0, 0.0);
 
         let Some(target_name) = device_name.filter(|s| !s.trim().is_empty()) else {
-            info!("Disconnected CoreAudio input on Mic {}", channel.one_based());
+            info!("Disconnected input on Mic {}", channel.one_based());
             drop(slot);
             return Ok(self.active_inputs());
         };
 
-        let host = cpal::default_host();
-        let device = host
-            .input_devices()
-            .map_err(|e| AudioError::Device(e.to_string()))?
-            .find(|d| cpal_device_name(d).as_deref() == Some(target_name))
-            .ok_or_else(|| {
-                AudioError::Device(format!(
-                    "Micro introuvable : « {target_name} ». Vérifiez que votre casque micro est bien connecté au Mac."
-                ))
-            })?;
+        #[cfg(target_os = "macos")]
+        {
+            let auth = ensure_microphone_permission(true);
+            if auth == 1 || auth == 2 {
+                return Err(AudioError::Device(
+                    "Autorisation Microphone refusée dans Réglages Système → Confidentialité et sécurité → Micro."
+                        .into(),
+                ));
+            }
 
-        let default_cfg = resolve_input_config(&device).ok_or_else(|| {
-            AudioError::Device(format!(
-                "Configuration d'entrée CoreAudio indisponible pour « {target_name} »"
-            ))
-        })?;
-        let sample_format = default_cfg.sample_format();
-        let config: StreamConfig = default_cfg.into();
-        let channels = config.channels.max(1) as usize;
-        let in_rate = config.sample_rate;
+            let c_target =
+                macos_av::make_cstring(target_name).map_err(AudioError::Device)?;
+            let producer = Arc::clone(&slot.producer);
+            let ctx = Box::new(AvCaptureCallbackCtx {
+                producer,
+                resampler: InlineMonoResampler::new(MASTER_SAMPLE_RATE, MASTER_SAMPLE_RATE),
+            });
+            let ctx_ptr = Box::into_raw(ctx);
 
-        let producer = Arc::clone(&slot.producer);
-        let mut resampler = InlineMonoResampler::new(in_rate, MASTER_SAMPLE_RATE);
+            let mut out_sr: u32 = MASTER_SAMPLE_RATE;
+            let mut out_ch: u16 = 1;
+            let mut err_buf = [0 as std::ffi::c_char; 512];
 
-        let err_name = target_name.to_string();
-        let err_fn = move |err: cpal::Error| {
-            warn!("CoreAudio input error on '{err_name}': {err}");
-        };
-
-        let stream = match sample_format {
-            SampleFormat::I16 => device
-                .build_input_stream(
-                    config,
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        if let Ok(mut prod) = producer.try_lock() {
-                            for frame in data.chunks_exact(channels) {
-                                let mut sum = 0.0_f32;
-                                for &s in frame {
-                                    sum += (s as f32) / 32768.0;
-                                }
-                                resampler.push_and_emit(sum / channels as f32, &mut prod);
-                            }
-                        }
-                    },
-                    err_fn,
-                    None,
+            let handle = unsafe {
+                macos_av::kp_av_start_capture(
+                    c_target.as_ptr(),
+                    on_av_audio_samples,
+                    ctx_ptr as *mut std::ffi::c_void,
+                    &mut out_sr,
+                    &mut out_ch,
+                    err_buf.as_mut_ptr(),
+                    err_buf.len(),
                 )
-                .map_err(|e| AudioError::Device(e.to_string()))?,
-            SampleFormat::U16 => device
-                .build_input_stream(
-                    config,
-                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                        if let Ok(mut prod) = producer.try_lock() {
-                            for frame in data.chunks_exact(channels) {
-                                let mut sum = 0.0_f32;
-                                for &s in frame {
-                                    sum += ((s as f32) - 32768.0) / 32768.0;
+            };
+
+            if handle.is_null() {
+                // Capture failed: callback delegate already cleared + drained inside `av_mic.m`.
+                unsafe { drop(Box::from_raw(ctx_ptr)) };
+                let msg = macos_av::cstr_to_string(&err_buf);
+                return Err(AudioError::Device(if msg.is_empty() {
+                    format!("Impossible d'activer le micro « {target_name} ».")
+                } else {
+                    msg
+                }));
+            }
+
+            slot.stream = Some(AvCaptureStream { handle, ctx_ptr });
+            slot.device_name = Some(target_name.to_string());
+            self.state
+                .mic_telemetry(channel)
+                .store_network(true, 3.0, 0.0);
+
+            info!(
+                "Connected AVFoundation input '{}' ({} Hz, {} ch) to Mic {}",
+                target_name,
+                out_sr,
+                out_ch,
+                channel.one_based()
+            );
+            drop(slot);
+            Ok(self.active_inputs())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+            use cpal::{SampleFormat, StreamConfig};
+            let host = cpal::default_host();
+            let device = host
+                .input_devices()
+                .map_err(|e| AudioError::Device(e.to_string()))?
+                .find(|d| d.description().ok().map(|x| x.name().to_string()).as_deref() == Some(target_name))
+                .ok_or_else(|| AudioError::Device(format!("Micro introuvable : « {target_name} »")))?;
+            let cfg = device
+                .default_input_config()
+                .map_err(|e| AudioError::Device(e.to_string()))?;
+            let fmt = cfg.sample_format();
+            let config: StreamConfig = cfg.into();
+            let ch = config.channels.max(1) as usize;
+            let mut resampler = InlineMonoResampler::new(config.sample_rate, MASTER_SAMPLE_RATE);
+            let producer = Arc::clone(&slot.producer);
+            let stream = match fmt {
+                SampleFormat::F32 => device
+                    .build_input_stream(
+                        config,
+                        move |data: &[f32], _| {
+                            if let Ok(mut p) = producer.try_lock() {
+                                for frame in data.chunks_exact(ch) {
+                                    let s = frame.iter().sum::<f32>() / ch as f32;
+                                    resampler.push_and_emit(s, &mut p);
                                 }
-                                resampler.push_and_emit(sum / channels as f32, &mut prod);
                             }
-                        }
-                    },
-                    err_fn,
-                    None,
-                )
-                .map_err(|e| AudioError::Device(e.to_string()))?,
-            // CoreAudio AUHAL natively supplies F32 for F32 / I24 / I32 hardware inputs
-            _ => device
-                .build_input_stream(
-                    config,
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        // STRICT REAL-TIME INPUT CALLBACK: zero allocations, zero syscalls, zero logging.
-                        if let Ok(mut prod) = producer.try_lock() {
-                            for frame in data.chunks_exact(channels) {
-                                let mut sum = 0.0_f32;
-                                for &s in frame {
-                                    sum += s;
-                                }
-                                resampler.push_and_emit(sum / channels as f32, &mut prod);
-                            }
-                        }
-                    },
-                    err_fn,
-                    None,
-                )
-                .map_err(|e| AudioError::Device(e.to_string()))?,
-        };
-
-        stream
-            .play()
-            .map_err(|e| AudioError::Device(e.to_string()))?;
-
-        slot.stream = Some(stream);
-        slot.device_name = Some(target_name.to_string());
-        // Native CoreAudio input latency (~2.7 ms at 128 frames, 0% packet loss)
-        self.state
-            .mic_telemetry(channel)
-            .store_network(true, 2.7, 0.0);
-
-        info!(
-            "Connected native CoreAudio input '{}' ({} Hz, {} ch) to Mic {}",
-            target_name,
-            in_rate,
-            channels,
-            channel.one_based()
-        );
-        drop(slot);
-        Ok(self.active_inputs())
+                        },
+                        move |e| warn!("Input error: {e}"),
+                        None,
+                    )
+                    .map_err(|e| AudioError::Device(e.to_string()))?,
+                _ => {
+                    return Err(AudioError::Device(format!("Unsupported format: {fmt:?}")));
+                }
+            };
+            stream.play().map_err(|e| AudioError::Device(e.to_string()))?;
+            slot.stream = Some(stream);
+            slot.device_name = Some(target_name.to_string());
+            self.state
+                .mic_telemetry(channel)
+                .store_network(true, 3.0, 0.0);
+            drop(slot);
+            Ok(self.active_inputs())
+        }
     }
 
     pub fn active_inputs(&self) -> ActiveMicInputs {
@@ -347,7 +494,6 @@ mod tests {
             let s = (i as f32 * 0.05).sin() * 0.5;
             r.push_and_emit(s, &mut prod);
         }
-        // Should execute cleanly with zero panic / finite values
         assert!(r.prev_sample.is_finite());
     }
 
@@ -368,8 +514,50 @@ mod tests {
         let inputs = list_audio_input_devices();
         eprintln!("Detected outputs ({}): {outputs:?}", outputs.len());
         eprintln!("Detected inputs ({}): {inputs:?}", inputs.len());
-        // On any macOS machine with speakers, at least one output must be present
         #[cfg(target_os = "macos")]
-        assert!(!outputs.is_empty(), "Expected CoreAudio outputs on macOS");
+        {
+            assert!(!outputs.is_empty(), "Expected CoreAudio outputs on macOS");
+            assert!(!inputs.is_empty(), "Expected AVFoundation inputs on macOS");
+        }
+    }
+
+    #[test]
+    fn macbook_internal_mic_detection_is_locale_agnostic() {
+        assert!(is_built_in_macbook_mic("Micro MacBook Pro"));
+        assert!(is_built_in_macbook_mic("MacBook Pro Microphone"));
+        assert!(is_built_in_macbook_mic("Built-in Microphone"));
+        assert!(is_built_in_macbook_mic("MacBook-Mikrofon"));
+        assert!(!is_built_in_macbook_mic("Nothing Headphone (a)"));
+        assert!(!is_built_in_macbook_mic("GLASS5 mini"));
+        assert!(!is_built_in_macbook_mic("Micro de « iPhone de Dany »"));
+    }
+
+    #[test]
+    #[ignore = "Requires live macOS audio hardware probe"]
+    fn probe_live_avfoundation_capture_all_mics() {
+        let inputs = list_audio_input_devices();
+        eprintln!("MacBook clamshell closed = {}", is_macbook_clamshell_closed());
+        for dev in inputs {
+            let (engine, mic_prods) = AudioEngine::new();
+            let _ = engine.select_output_device(None);
+            let mgr = NativeMicInputManager::new(engine.state(), mic_prods);
+            match mgr.select_device(MicChannelId::Mic1, Some(&dev.name)) {
+                Ok(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    let t = engine.telemetry();
+                    eprintln!(
+                        "AVF '{}' ({} Hz, iphone={}): connected={}, vu_db={:.1}, peak={:.5}, gate_open={}",
+                        dev.name,
+                        dev.sample_rate,
+                        dev.is_iphone,
+                        t.mic1.connected,
+                        t.mic1.vu_db,
+                        t.mic1.peak,
+                        t.mic1.gate_open
+                    );
+                }
+                Err(e) => eprintln!("AVF '{}': ERR {e}", dev.name),
+            }
+        }
     }
 }

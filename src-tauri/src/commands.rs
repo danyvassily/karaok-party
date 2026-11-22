@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use karaok_ai::{
@@ -8,7 +9,8 @@ use karaok_ai::{
     PlaylistTrackCandidate, WhisperAlignConfig,
 };
 use karaok_audio::{
-    decode_audio_to_48khz_stereo, list_audio_input_devices as enumerate_coreaudio_inputs,
+    decode_audio_to_48khz_stereo, is_macbook_clamshell_closed,
+    list_audio_input_devices as enumerate_coreaudio_inputs,
     list_audio_output_devices as enumerate_coreaudio_outputs, mix_and_export_recording,
     AudioEngine, NativeMicInputManager,
 };
@@ -34,6 +36,7 @@ pub struct AppState {
     pub audio: Arc<AudioEngine>,
     pub mic_inputs: Arc<NativeMicInputManager>,
     pub lrclib: LrclibClient,
+    pub checked_legacy_lyrics: Arc<Mutex<HashSet<String>>>,
 }
 
 #[tauri::command]
@@ -414,18 +417,25 @@ pub fn get_audio_routing_state(state: State<'_, AppState>) -> AudioRoutingState 
         output_device: state.audio.active_output_device(),
         mic1_device: mics.mic1_device,
         mic2_device: mics.mic2_device,
+        clamshell_closed: is_macbook_clamshell_closed(),
     }
 }
 
 #[tauri::command]
-pub fn select_mic_input_device(
+pub fn play_output_test_tone(state: State<'_, AppState>) {
+    state.audio.play_output_test_tone();
+}
+
+#[tauri::command]
+pub async fn select_mic_input_device(
     channel: MicChannelId,
     device_name: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ActiveMicInputs, String> {
-    state
-        .mic_inputs
-        .select_device(channel, device_name.as_deref())
+    let mic_inputs = Arc::clone(&state.mic_inputs);
+    tokio::task::spawn_blocking(move || mic_inputs.select_device(channel, device_name.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
 }
 
@@ -466,13 +476,62 @@ pub fn get_mic_params(channel: MicChannelId, state: State<'_, AppState>) -> Voca
 #[tauri::command]
 pub async fn get_lyrics(
     track_id: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<LyricsDocument>, String> {
-    state
+    let existing = state
         .db
         .get_lyrics(&track_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // Upgrade legacy pre-detector `whisper` alignments that fired during an instrumental intro (< 1s)
+    // Memoize checked track IDs in `AppState` so tracks that genuinely begin singing <1s never re-decode.
+    let already_checked = state
+        .checked_legacy_lyrics
+        .lock()
+        .map(|g| g.contains(&track_id))
+        .unwrap_or(false);
+    if !already_checked {
+        if let Some(ref doc) = existing {
+            if doc.source == LyricsSource::Whisper
+                && doc.offset_ms == 0
+                && doc.lines.first().is_some_and(|l| l.start_ms < 1000)
+            {
+                if let Ok(mut g) = state.checked_legacy_lyrics.lock() {
+                    g.insert(track_id.clone());
+                }
+                if let Ok(track) = state.db.get_track(&track_id).await {
+                    let source_orig = PathBuf::from(&track.source_path);
+                    if track.duration_ms > 45_000 && source_orig.exists() {
+                        let plain = doc
+                            .lines
+                            .iter()
+                            .map(|l| l.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if let Ok(Ok(realigned)) = tokio::task::spawn_blocking(move || {
+                            align_plain_lyrics_to_vocals(
+                                &source_orig,
+                                &plain,
+                                &WhisperAlignConfig::default(),
+                            )
+                        })
+                        .await
+                        {
+                            if realigned.lines.first().is_some_and(|l| l.start_ms >= 2500) {
+                                let _ = state.db.save_lyrics(&track_id, &realigned).await;
+                                let _ = app.emit("lyrics-updated", &track_id);
+                                return Ok(Some(realigned));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(existing)
 }
 
 #[tauri::command]
@@ -508,12 +567,17 @@ async fn auto_align_if_plain(
         .map(|l| l.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let audio_path = track
-        .stems_dir
-        .as_ref()
-        .map(|d| PathBuf::from(d).join("vocals.wav"))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from(&track.source_path));
+    let source_orig = PathBuf::from(&track.source_path);
+    let audio_path = if source_orig.exists() {
+        source_orig
+    } else {
+        track
+            .stems_dir
+            .as_ref()
+            .map(|d| PathBuf::from(d).join("vocals.wav"))
+            .filter(|p| p.exists())
+            .unwrap_or(source_orig)
+    };
     if !audio_path.exists() {
         return doc;
     }
@@ -642,13 +706,19 @@ pub async fn auto_align_lyrics_whisper(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Prefer isolated vocals.wav if stems exist, otherwise original audio
-    let audio_path = track
-        .stems_dir
-        .as_ref()
-        .map(|d| PathBuf::from(d).join("vocals.wav"))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from(&track.source_path));
+    // Prefer original stereo mix for Center-Band Formant + ZCR vocal onset detection (avoids
+    // leaked piano/chord false triggers in legacy v1 vocals.wav stems)
+    let source_orig = PathBuf::from(&track.source_path);
+    let audio_path = if source_orig.exists() {
+        source_orig
+    } else {
+        track
+            .stems_dir
+            .as_ref()
+            .map(|d| PathBuf::from(d).join("vocals.wav"))
+            .filter(|p| p.exists())
+            .unwrap_or(source_orig)
+    };
 
     let doc = tokio::task::spawn_blocking(move || {
         align_plain_lyrics_to_vocals(&audio_path, &plain_lyrics, &WhisperAlignConfig::default())
@@ -657,6 +727,51 @@ pub async fn auto_align_lyrics_whisper(
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
 
+    state
+        .db
+        .save_lyrics(&track_id, &doc)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("lyrics-updated", &track_id);
+    Ok(doc)
+}
+
+#[tauri::command]
+pub async fn realign_lyrics_vocal_onset(
+    track_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<LyricsDocument, String> {
+    let existing = state
+        .db
+        .get_lyrics(&track_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Aucune parole chargée pour ce morceau".to_string())?;
+    let plain_lyrics = existing
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    auto_align_lyrics_whisper(track_id, plain_lyrics, app, state).await
+}
+
+#[tauri::command]
+pub async fn set_lyrics_start_here(
+    track_id: String,
+    position_ms: u64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<LyricsDocument, String> {
+    let mut doc = state
+        .db
+        .get_lyrics(&track_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Aucune parole chargée pour ce morceau".to_string())?;
+    let first_start = doc.lines.first().map_or(0, |l| l.start_ms);
+    doc.offset_ms = (first_start as i64 - position_ms as i64).clamp(-120_000, 120_000);
     state
         .db
         .save_lyrics(&track_id, &doc)

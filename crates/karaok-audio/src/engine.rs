@@ -471,6 +471,8 @@ impl AudioEngine {
         let mut mic2_primed = false;
         let mut mic1_last = 0.0_f32;
         let mut mic2_last = 0.0_f32;
+        let mut chime_remaining: u32 = 0;
+        let mut chime_phase: f32 = 0.0;
 
         // Zero-alloc inline output resampler (internal 48 kHz -> speaker native rate e.g. 44.1 / 48 kHz)
         let rate_step: f64 = (MASTER_SAMPLE_RATE as f64) / (out_rate as f64);
@@ -506,12 +508,18 @@ impl AudioEngine {
                 .min(250) as usize;
             let delay_frames = (delay_ms * MASTER_SAMPLE_RATE as usize) / 1000;
 
+            let pending_chime = state.test_tone_frames.swap(0, Ordering::AcqRel);
+            if pending_chime > 0 {
+                chime_remaining = pending_chime;
+                chime_phase = 0.0;
+            }
+
             if mic1_connected {
-                if !mic1_primed && c.mic1_cons.occupied_len() >= 256 {
+                if !mic1_primed && c.mic1_cons.occupied_len() >= 512 {
                     mic1_primed = true;
                 }
-                if c.mic1_cons.occupied_len() > 2400 {
-                    let drop_n = c.mic1_cons.occupied_len() - 384;
+                if c.mic1_cons.occupied_len() > 3600 {
+                    let drop_n = c.mic1_cons.occupied_len() - 960;
                     for _ in 0..drop_n {
                         let _ = c.mic1_cons.try_pop();
                     }
@@ -522,11 +530,11 @@ impl AudioEngine {
             }
 
             if mic2_connected {
-                if !mic2_primed && c.mic2_cons.occupied_len() >= 256 {
+                if !mic2_primed && c.mic2_cons.occupied_len() >= 512 {
                     mic2_primed = true;
                 }
-                if c.mic2_cons.occupied_len() > 2400 {
-                    let drop_n = c.mic2_cons.occupied_len() - 384;
+                if c.mic2_cons.occupied_len() > 3600 {
+                    let drop_n = c.mic2_cons.occupied_len() - 960;
                     for _ in 0..drop_n {
                         let _ = c.mic2_cons.try_pop();
                     }
@@ -556,11 +564,11 @@ impl AudioEngine {
                             s
                         } else {
                             mic1_primed = false;
-                            mic1_last *= 0.9;
+                            mic1_last *= 0.96;
                             mic1_last
                         }
                     } else {
-                        mic1_last *= 0.9;
+                        mic1_last *= 0.96;
                         mic1_last
                     };
                     mic1_dsp.process_sample(raw_m1, effective_key, &mic1_params)
@@ -575,16 +583,37 @@ impl AudioEngine {
                             s
                         } else {
                             mic2_primed = false;
-                            mic2_last *= 0.9;
+                            mic2_last *= 0.96;
                             mic2_last
                         }
                     } else {
-                        mic2_last *= 0.9;
+                        mic2_last *= 0.96;
                         mic2_last
                     };
                     mic2_dsp.process_sample(raw_m2, effective_key, &mic2_params)
                 } else {
                     (0.0, 0.0)
+                };
+
+                let chime = if chime_remaining > 0 {
+                    chime_remaining -= 1;
+                    // Gentle C5 -> E5 -> G5 arpeggio chime (28,800 frames = 600 ms)
+                    let elapsed = 28_800u32.saturating_sub(chime_remaining);
+                    let freq = if elapsed < 9600 {
+                        523.25_f32
+                    } else if elapsed < 19_200 {
+                        659.25_f32
+                    } else {
+                        783.99_f32
+                    };
+                    let env = (chime_remaining as f32 / 28_800.0).min(1.0);
+                    chime_phase += core::f32::consts::TAU * freq / (MASTER_SAMPLE_RATE as f32);
+                    if chime_phase >= core::f32::consts::TAU {
+                        chime_phase -= core::f32::consts::TAU;
+                    }
+                    0.22 * env * chime_phase.sin()
+                } else {
+                    0.0
                 };
 
                 if is_recording {
@@ -599,8 +628,8 @@ impl AudioEngine {
                 }
 
                 (
-                    soft_limit(instru_l + m1_l + m2_l),
-                    soft_limit(instru_r + m1_r + m2_r),
+                    soft_limit(instru_l * 0.72 + m1_l + m2_l + chime),
+                    soft_limit(instru_r * 0.72 + m1_r + m2_r + chime),
                 )
             };
 
@@ -876,6 +905,11 @@ impl AudioEngine {
         self.state.mic_params(ch).store(&params);
     }
 
+    /// Triggers a brief 0.6s stereo harmonic test chime directly on the active output speaker.
+    pub fn play_output_test_tone(&self) {
+        self.state.test_tone_frames.store(28_800, Ordering::Release);
+    }
+
     pub fn start_recording(&self, recordings_dir: &Path, title: String) -> AudioResult<()> {
         let mut guard = self
             .active_recording
@@ -1117,5 +1151,58 @@ mod tests {
             engine.active_output_device().as_deref(),
             Some(alt_speaker.name.as_str())
         );
+    }
+
+    #[test]
+    fn mic_voice_return_flows_end_to_end_with_autotune_and_reverb() {
+        use std::f32::consts::TAU;
+        let (engine, [mut mic1_prod, _mic2_prod]) = AudioEngine::new();
+        if engine.select_output_device(None).is_err() {
+            return;
+        }
+        engine.state().mic_telemetry(MicChannelId::Mic1).store_network(true, 2.7, 0.0);
+
+        let rec_dir = std::env::temp_dir().join(format!("karaok-e2e-rec-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&rec_dir);
+        engine
+            .start_recording(&rec_dir, "SelfTest Voice Return".into())
+            .expect("start recording");
+
+        // Feed 0.4s of a slightly flat 432 Hz singing tone into Mic 1 @ 48 kHz
+        let chunk: Vec<f32> = (0..480)
+            .map(|i| 0.08 * (TAU * 432.0 * (i as f32) / 48_000.0).sin())
+            .collect();
+        for _ in 0..40 {
+            mic1_prod.push_samples(&chunk);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let telemetry = engine.telemetry();
+        let entry = engine.stop_recording().expect("stop recording");
+        let mic1_wav = decode_audio_to_48khz_stereo(Path::new(&entry.mic1_path))
+            .expect("decode captured mic1 wav");
+        let peak_out = mic1_wav
+            .left
+            .iter()
+            .chain(mic1_wav.right.iter())
+            .map(|s| s.abs())
+            .fold(0.0_f32, f32::max);
+        let stereo_diff = mic1_wav
+            .left
+            .iter()
+            .zip(mic1_wav.right.iter())
+            .map(|(l, r)| (l - r).abs())
+            .fold(0.0_f32, f32::max);
+
+        eprintln!(
+            "E2E Voice Return -> vu_db={:.1}, peak={:.4}, gate_open={}, wav_peak={:.4}, reverb_stereo_diff={:.4}",
+            telemetry.mic1.vu_db, telemetry.mic1.peak, telemetry.mic1.gate_open, peak_out, stereo_diff
+        );
+        assert!(telemetry.mic1.gate_open, "Expected NoiseGate to open on sung tone");
+        assert!(telemetry.mic1.vu_db > -30.0, "Expected strong VU level, got {}", telemetry.mic1.vu_db);
+        assert!(peak_out > 0.08, "Expected boosted vocal return in output mix, got {peak_out}");
+        assert!(stereo_diff > 0.002, "Expected active stereo reverb width on voice return");
+
+        let _ = std::fs::remove_dir_all(&rec_dir);
     }
 }

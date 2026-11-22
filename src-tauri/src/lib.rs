@@ -1,11 +1,15 @@
 mod commands;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use karaok_ai::LrclibClient;
-use karaok_audio::{list_audio_input_devices, AudioEngine, NativeMicInputManager};
+use karaok_audio::{
+    ensure_microphone_permission, is_built_in_macbook_mic, is_macbook_clamshell_closed,
+    list_audio_input_devices, AudioEngine, NativeMicInputManager,
+};
 use karaok_core::{AudioBufferSize, MicChannelId};
 use karaok_db::KaraokDatabase;
 use tauri::{Emitter, Manager};
@@ -52,21 +56,6 @@ pub fn run() {
             let audio = Arc::new(audio_engine);
             let mic_inputs = Arc::new(NativeMicInputManager::new(audio.state(), mic_producers));
 
-            // Auto-connect a clean >= 44.1 kHz headset/Mac microphone (never 8 kHz Bluetooth HFP
-            // which forces macOS Bluetooth speakers into degraded mono hands-free audio!)
-            let devices = list_audio_input_devices();
-            let preferred_mic = devices
-                .iter()
-                .find(|d| !d.is_iphone && d.sample_rate >= 44_100 && d.name.to_lowercase().contains("externe"))
-                .or_else(|| devices.iter().find(|d| !d.is_iphone && d.sample_rate >= 44_100 && d.is_default))
-                .or_else(|| devices.iter().find(|d| !d.is_iphone && d.sample_rate >= 44_100));
-            if let Some(mic) = preferred_mic {
-                match mic_inputs.select_device(MicChannelId::Mic1, Some(&mic.name)) {
-                    Ok(_) => info!("Auto-connected headset/Mac microphone '{}' ({} Hz) to Mic 1", mic.name, mic.sample_rate),
-                    Err(err) => warn!("Could not auto-connect microphone '{}': {err}", mic.name),
-                }
-            }
-
             // 60 Hz real-time telemetry emitter synchronized across Main + TV windows
             let telemetry_audio = Arc::clone(&audio);
             let app_handle_tick = app.handle().clone();
@@ -86,8 +75,84 @@ pub fn run() {
                 recordings_dir,
                 db,
                 audio,
-                mic_inputs,
+                mic_inputs: Arc::clone(&mic_inputs),
                 lrclib: LrclibClient::new(),
+                checked_legacy_lyrics: Arc::new(Mutex::new(HashSet::new())),
+            });
+
+            // Initialize TCC permission + auto-connect a non-clamshell mic OFF the AppKit main
+            // thread so window launch is instant even when AVFoundation/BT/Continuity initializes.
+            let startup_mics = Arc::clone(&mic_inputs);
+            let startup_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let connected_name = tokio::task::spawn_blocking(move || {
+                    let _ = ensure_microphone_permission(true);
+                    let clamshell_closed = is_macbook_clamshell_closed();
+                    let devices = list_audio_input_devices();
+                    let is_virtual = |d: &karaok_core::AudioInputDeviceInfo| {
+                        let l = d.name.to_lowercase();
+                        l.contains("teams") || l.contains("blackhole") || l.contains("virtual")
+                    };
+                    let is_clamshell_muted = |d: &karaok_core::AudioInputDeviceInfo| {
+                        clamshell_closed && is_built_in_macbook_mic(&d.name)
+                    };
+
+                    let preferred_mic = devices
+                        .iter()
+                        .find(|d| {
+                            !is_virtual(d)
+                                && !is_clamshell_muted(d)
+                                && !d.is_iphone
+                                && d.sample_rate >= 44_100
+                                && !is_built_in_macbook_mic(&d.name)
+                        })
+                        .or_else(|| {
+                            devices.iter().find(|d| {
+                                !is_virtual(d)
+                                    && !is_clamshell_muted(d)
+                                    && d.sample_rate >= 44_100
+                                    && d.is_iphone
+                            })
+                        })
+                        .or_else(|| {
+                            devices.iter().find(|d| {
+                                !is_virtual(d) && !is_clamshell_muted(d) && d.sample_rate >= 44_100
+                            })
+                        })
+                        .or_else(|| {
+                            devices.iter().find(|d| {
+                                !is_virtual(d) && !is_clamshell_muted(d) && d.sample_rate >= 16_000
+                            })
+                        })
+                        .or_else(|| {
+                            devices
+                                .iter()
+                                .find(|d| !is_virtual(d) && !is_clamshell_muted(d))
+                        });
+
+                    if let Some(mic) = preferred_mic {
+                        match startup_mics.select_device(MicChannelId::Mic1, Some(&mic.name)) {
+                            Ok(_) => {
+                                info!(
+                                    "Auto-connected microphone '{}' ({} Hz, clamshell_closed={}) to Mic 1",
+                                    mic.name, mic.sample_rate, clamshell_closed
+                                );
+                                return Some(mic.name.clone());
+                            }
+                            Err(err) => {
+                                warn!("Could not auto-connect microphone '{}': {err}", mic.name);
+                            }
+                        }
+                    }
+                    None
+                })
+                .await
+                .ok()
+                .flatten();
+
+                if connected_name.is_some() {
+                    let _ = startup_app.emit("audio-routing-updated", ());
+                }
             });
 
             Ok(())
@@ -114,6 +179,7 @@ pub fn run() {
             commands::list_audio_output_devices,
             commands::select_audio_output_device,
             commands::get_audio_routing_state,
+            commands::play_output_test_tone,
             commands::select_mic_input_device,
             commands::get_active_mic_inputs,
             commands::set_mic_preset,
@@ -125,6 +191,8 @@ pub fn run() {
             commands::fetch_lrclib_lyrics,
             commands::open_google_lyrics_search,
             commands::auto_align_lyrics_whisper,
+            commands::realign_lyrics_vocal_onset,
+            commands::set_lyrics_start_here,
             commands::shift_lyrics_offset,
             commands::list_queue,
             commands::enqueue_track,

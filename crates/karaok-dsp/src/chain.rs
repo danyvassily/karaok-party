@@ -101,7 +101,7 @@ impl VocalDspChain {
         }
 
         // 1. Input gain & HPF 80 Hz
-        let x = sanitize_sample(input) * params.gain.clamp(0.0, 2.5);
+        let x = sanitize_sample(input) * params.gain.clamp(0.0, 4.0);
         let hpf_out = self.hpf.process(x);
 
         // 2. Noise Gate (anti-Larsen speaker bleed rejection)

@@ -15,6 +15,7 @@ interface VoiceMicDrawerProps {
   open: boolean;
   outputDevices: AudioOutputDeviceInfo[];
   activeOutputDevice: string | null;
+  clamshellClosed: boolean;
   inputDevices: AudioInputDeviceInfo[];
   activeMicInputs: ActiveMicInputs;
   micError: string | null;
@@ -26,6 +27,7 @@ interface VoiceMicDrawerProps {
   bufferSize: string;
   onClose: () => void;
   onRefreshDevices: () => void;
+  onTestOutputTone: () => void;
   onSelectOutputDevice: (deviceName: string | null) => void;
   onSelectInputDevice: (ch: MicChannelId, deviceName: string | null) => void;
   onSelectPreset: (ch: MicChannelId, preset: VocalPreset) => void;
@@ -41,10 +43,21 @@ const PRESETS: { id: VocalPreset; label: string; desc: string }[] = [
   { id: "expert", label: "Mode Expert", desc: "Tous les réglages DSP" },
 ];
 
+const isBuiltInMacBookMic = (name?: string | null): boolean => {
+  if (!name) return false;
+  const l = name.toLowerCase();
+  return (
+    l.includes("built-in") ||
+    l.includes("interne") ||
+    (l.includes("macbook") && (l.includes("micro") || l.includes("mikro") || l.includes("mic")))
+  );
+};
+
 export function VoiceMicDrawer({
   open,
   outputDevices,
   activeOutputDevice,
+  clamshellClosed,
   inputDevices,
   activeMicInputs,
   micError,
@@ -55,6 +68,7 @@ export function VoiceMicDrawer({
   latencyCalibrationMs,
   onClose,
   onRefreshDevices,
+  onTestOutputTone,
   onSelectOutputDevice,
   onSelectInputDevice,
   onSelectPreset,
@@ -120,9 +134,18 @@ export function VoiceMicDrawer({
                 Sortie Audio (Enceintes / TV / Casque)
               </h3>
             </div>
-            <span className="text-[10px] font-medium text-emerald-300">
-              {outputDevices.length} détectées
-            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onTestOutputTone}
+                className="rounded-lg border border-emerald-400/35 bg-emerald-400/15 px-2.5 py-1 text-[10px] font-bold text-emerald-200 transition hover:bg-emerald-400/25"
+              >
+                Tester enceintes
+              </button>
+              <span className="text-[10px] font-medium text-emerald-300">
+                {outputDevices.length} détectées
+              </span>
+            </div>
           </div>
 
           <select
@@ -153,10 +176,18 @@ export function VoiceMicDrawer({
             </h3>
           </div>
 
+          {clamshellClosed &&
+            (isBuiltInMacBookMic(activeMicInputs.mic1Device) ||
+              isBuiltInMacBookMic(activeMicInputs.mic2Device)) && (
+              <p className="rounded-xl border border-rose-400/35 bg-rose-500/10 px-3.5 py-2.5 text-[11px] leading-relaxed text-rose-200">
+                <strong>Capot du MacBook fermé :</strong> macOS coupe matériellement le microphone interne lorsque l'ordinateur est fermé. Sélectionnez votre <strong>casque micro</strong>, le <strong>Micro de votre iPhone</strong> ou un micro USB.
+              </p>
+            )}
+
           {((mic1Telemetry.connected && !mic1Params.muted && mic1Telemetry.vuDb <= -90) ||
             (mic2Telemetry.connected && !mic2Params.muted && mic2Telemetry.vuDb <= -90)) && (
             <p className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3.5 py-2.5 text-[11px] leading-relaxed text-amber-200">
-              <strong>Aucun signal micro détecté (-96 dB) :</strong> parlez dans votre casque micro ou vérifiez l'autorisation dans{" "}
+              <strong>Aucun signal micro détecté (-96 dB) :</strong> parlez dans votre casque micro (le Bluetooth met 1 à 2 s à s'activer) ou vérifiez l'autorisation dans{" "}
               <strong>Réglages Système → Confidentialité et sécurité → Micro</strong>.
             </p>
           )}
@@ -272,7 +303,7 @@ export function VoiceMicDrawer({
             label="Volume Retour Voix (Micro)"
             value={Math.round(activeParams.gain * 100)}
             min={0}
-            max={250}
+            max={400}
             unit="%"
             onChange={(v) => patchParam("gain", v / 100)}
           />
