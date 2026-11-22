@@ -21,10 +21,11 @@ pub enum CertError {
     Io(#[from] std::io::Error),
 }
 
-/// Persisted Local Root CA + leaf HTTPS server certificate PEM bundle.
+/// Persisted Local Root CA + leaf HTTPS server certificate PEM/DER bundle.
 #[derive(Debug, Clone)]
 pub struct LocalTlsBundle {
     pub ca_cert_pem: String,
+    pub ca_cert_der: Vec<u8>,
     pub server_cert_pem: String,
     pub server_key_pem: String,
 }
@@ -90,8 +91,11 @@ pub fn ensure_local_tls_certs(certs_dir: &Path, lan_ip: IpAddr) -> Result<LocalT
     std::fs::write(&server_cert_path, &server_cert_pem)?;
     write_private_key_file(&server_key_path, &server_key_pem)?;
 
+    let ca_cert_der = ca_cert.der().to_vec();
+
     Ok(LocalTlsBundle {
         ca_cert_pem,
+        ca_cert_der,
         server_cert_pem,
         server_key_pem,
     })
@@ -148,6 +152,7 @@ mod tests {
         let bundle =
             ensure_local_tls_certs(&dir, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42))).unwrap();
         assert!(bundle.ca_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(bundle.ca_cert_der.first() == Some(&0x30)); // ASN.1 DER SEQUENCE
         assert!(bundle.server_cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(bundle.server_key_pem.contains("BEGIN PRIVATE KEY"));
 

@@ -145,6 +145,7 @@ export interface MicPairingInfo {
   lanIp: string;
   port: number;
   caCertUrl: string;
+  caCertQrSvg: string;
   mic1Url: string;
   mic2Url: string;
   mic1QrSvg: string;

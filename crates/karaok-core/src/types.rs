@@ -391,6 +391,7 @@ pub struct MicPairingInfo {
     pub lan_ip: String,
     pub port: u16,
     pub ca_cert_url: String,
+    pub ca_cert_qr_svg: String,
     pub mic1_url: String,
     pub mic2_url: String,
     pub mic1_qr_svg: String,

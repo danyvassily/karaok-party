@@ -110,20 +110,34 @@ export function VoiceMicDrawer({
           />
         </section>
 
-        {/* 1-tap iPhone Local CA Certificate Helper */}
-        <section className="rounded-xl border border-sky-400/20 bg-sky-500/8 p-3.5">
-          <div className="flex items-start gap-2.5">
-            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-sky-400" />
-            <div className="min-w-0 flex-1 space-y-1">
-              <p className="text-xs font-semibold text-slate-100">
-                Premier appairage Safari iOS (Certificat HTTPS local)
-              </p>
+        {/* 1-tap iPhone Local CA Certificate Helper (plain HTTP :8444 — zero red TLS warning) */}
+        <section className="rounded-xl border border-sky-400/25 bg-sky-500/8 p-3.5">
+          <div className="flex items-center gap-3">
+            {pairingInfo?.caCertQrSvg && (
+              <div className="h-24 w-24 shrink-0 overflow-hidden rounded-lg bg-white p-1.5">
+                <img
+                  src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+                    pairingInfo.caCertQrSvg
+                  )}`}
+                  alt="QR Code installation certificat iPhone"
+                  className="h-full w-full object-contain"
+                />
+              </div>
+            )}
+            <div className="min-w-0 flex-1 space-y-1.5">
+              <div className="flex items-center gap-1.5">
+                <ShieldCheck className="h-4 w-4 shrink-0 text-sky-400" />
+                <p className="text-xs font-bold text-slate-100">
+                  1re connexion iPhone (Sans avertissement)
+                </p>
+              </div>
               <p className="text-[11px] leading-relaxed text-slate-300">
-                Ouvrez{" "}
-                <code className="rounded bg-black/40 px-1.5 py-0.5 text-[10px] text-sky-300">
-                  {pairingInfo?.caCertUrl ?? "https://karaok-party.local:8443/cert/install"}
+                Scannez ce QR (ouvrir dans <strong>Safari</strong>) ou visitez{" "}
+                <code className="rounded bg-black/40 px-1.5 py-0.5 text-[10px] text-sky-300 break-all">
+                  {pairingInfo?.caCertUrl ?? "http://karaok-party.local:8444/cert/install"}
                 </code>{" "}
-                sur l'iPhone pour installer le profil <strong>Karaok Party Local CA</strong> en 1 tap.
+                pour installer <strong>Karaok Party Local CA (.cer)</strong> en 1 tap, puis activez-le dans{" "}
+                <em>Réglages → Informations → Réglages des certificats</em>.
               </p>
             </div>
           </div>

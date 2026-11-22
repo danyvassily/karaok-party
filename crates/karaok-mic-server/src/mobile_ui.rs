@@ -367,7 +367,8 @@ pub fn escape_js_inline_json(value: &str) -> String {
         .replace('/', "\\/")
 }
 
-/// Renders the 1-tap iPhone certificate installation guide page (`/cert/install`).
+/// Renders the 1-tap iPhone certificate installation guide page (`/cert/install`),
+/// served over plain local HTTP (`:8444`) so guests never see a red TLS warning before installing.
 pub const CERT_INSTALL_HTML: &str = r#"<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -375,21 +376,28 @@ pub const CERT_INSTALL_HTML: &str = r#"<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Certificat local — Karaok Party</title>
 <style>
-  body { background: #05070c; color: #f8fafc; font-family: -apple-system, sans-serif; padding: 28px 20px; line-height: 1.5; max-width: 520px; margin: auto; }
+  body { background: #05070c; color: #f8fafc; font-family: -apple-system, sans-serif; padding: 28px 20px; line-height: 1.55; max-width: 520px; margin: auto; }
   h1 { font-size: 24px; margin-bottom: 8px; }
-  .btn { display: block; text-align: center; background: #38bdf8; color: #020617; font-weight: 700; padding: 15px 18px; border-radius: 14px; text-decoration: none; margin: 20px 0; }
+  .note { background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.35); color: #fde68a; border-radius: 12px; padding: 12px 14px; font-size: 13px; margin: 14px 0; }
+  .btn { display: block; text-align: center; background: #38bdf8; color: #020617; font-weight: 700; padding: 16px 18px; border-radius: 14px; text-decoration: none; margin: 18px 0; font-size: 16px; }
+  .btn-sub { display: block; text-align: center; color: #94a3b8; font-size: 13px; margin-top: -10px; margin-bottom: 18px; }
   ol { padding-left: 20px; color: #cbd5e1; }
   li { margin-bottom: 10px; }
 </style>
 </head>
 <body>
-  <h1>Activer le micro Safari iOS</h1>
-  <p>Safari iOS exige une connexion HTTPS de confiance pour accéder au microphone en basse latence sur le Wi-Fi local.</p>
-  <a class="btn" href="/cert/karaok-party-ca.pem">1. Télécharger le certificat local (.pem)</a>
+  <h1>Activer le micro iPhone (1re fois)</h1>
+  <p>iOS exige un certificat local approuvé pour accéder au microphone en temps réel sur votre Wi-Fi.</p>
+  <div class="note">
+    <strong>Important :</strong> ouvrez cette page dans <strong>Safari</strong> (iOS n'affiche pas l'installation de profil dans Chrome).
+  </div>
+  <a class="btn" href="/cert/karaok-party-ca.cer">1. Installer le certificat local (.cer)</a>
+  <a class="btn-sub" href="/cert/karaok-party-ca.pem">Alternative : télécharger au format .pem</a>
   <ol>
-    <li>Ouvrez <strong>Réglages → Général → VPN et gestion de l'appareil</strong> et installez le profil <em>Karaok Party Local CA</em>.</li>
-    <li>Ouvrez <strong>Réglages → Général → Informations → Réglages des certificats</strong> et activez la confiance pour <em>Karaok Party Local CA</em>.</li>
-    <li>Scannez à nouveau le QR Code <strong>Micro 1</strong> ou <strong>Micro 2</strong> sur votre Mac !</li>
+    <li>Touchez <strong>Autoriser</strong> lorsque Safari propose de télécharger le profil de configuration.</li>
+    <li>Ouvrez <strong>Réglages → Général → VPN et gestion de l'appareil</strong> → <em>Karaok Party Local CA</em> → <strong>Installer</strong>.</li>
+    <li>Ouvrez <strong>Réglages → Général → Informations → Réglages des certificats</strong> et activez <em>Karaok Party Local CA</em>.</li>
+    <li>Scannez ensuite le QR Code <strong>Micro 1</strong> ou <strong>Micro 2</strong> sur votre Mac : plus aucun avertissement !</li>
   </ol>
 </body>
 </html>"#;

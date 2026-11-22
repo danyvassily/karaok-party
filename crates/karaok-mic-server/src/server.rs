@@ -27,6 +27,10 @@ use crate::protocol::{AudioFramePacket, ClientControlMessage, ServerControlMessa
 use crate::qr::generate_qr_svg;
 
 pub const DEFAULT_MIC_SERVER_PORT: u16 = 8443;
+/// Dedicated plain-HTTP onboarding port serving ONLY the public Local CA certificate
+/// (zero session tokens, zero audio routes) so iPhone guests never hit a red TLS warning
+/// when installing `Karaok Party Local CA` for the first time.
+pub const DEFAULT_CERT_HTTP_PORT: u16 = 8444;
 pub const MDNS_HOSTNAME: &str = "karaok-party.local";
 
 #[derive(Debug, Error)]
@@ -50,9 +54,16 @@ pub struct RemoteQueueRequest {
 struct ServerState {
     session_token: String,
     ca_cert_pem: String,
+    ca_cert_der: Vec<u8>,
     engine_state: Arc<AtomicEngineState>,
     mic_producers: [Arc<Mutex<MicAudioProducer>>; 2],
     queue_tx: mpsc::UnboundedSender<RemoteQueueRequest>,
+}
+
+#[derive(Clone)]
+struct CertOnboardingState {
+    ca_cert_pem: String,
+    ca_cert_der: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -60,11 +71,12 @@ struct AuthQuery {
     token: Option<String>,
 }
 
-/// Handle to the running local HTTPS/WSS microphone server + mDNS Bonjour advertiser.
+/// Handle to the running local HTTPS/WSS microphone server + HTTP CA onboarding server + mDNS advertiser.
 pub struct MicServer {
     pairing_info: MicPairingInfo,
     _mdns_daemon: Option<ServiceDaemon>,
     handle: axum_server::Handle<SocketAddr>,
+    cert_http_handle: axum_server::Handle<SocketAddr>,
 }
 
 impl MicServer {
@@ -92,9 +104,14 @@ impl MicServer {
         let (queue_tx, queue_rx) = mpsc::unbounded_channel();
 
         let [p1, p2] = mic_producers;
+        let cert_state = CertOnboardingState {
+            ca_cert_pem: tls_bundle.ca_cert_pem.clone(),
+            ca_cert_der: tls_bundle.ca_cert_der.clone(),
+        };
         let state = ServerState {
             session_token: session_token.clone(),
             ca_cert_pem: tls_bundle.ca_cert_pem,
+            ca_cert_der: tls_bundle.ca_cert_der,
             engine_state,
             mic_producers: [Arc::new(Mutex::new(p1)), Arc::new(Mutex::new(p2))],
             queue_tx,
@@ -104,9 +121,17 @@ impl MicServer {
             .route("/mic/{id}", get(handle_mic_page))
             .route("/mic-worklet.js", get(handle_worklet_js))
             .route("/cert/install", get(handle_cert_install_page))
+            .route("/cert/karaok-party-ca.cer", get(handle_ca_cert_der_https))
             .route("/cert/karaok-party-ca.pem", get(handle_ca_cert_download))
             .route("/ws/mic/{id}", get(handle_mic_ws))
             .with_state(state);
+
+        let cert_http_app = Router::new()
+            .route("/", get(handle_cert_install_page))
+            .route("/cert/install", get(handle_cert_install_page))
+            .route("/cert/karaok-party-ca.cer", get(handle_ca_cert_der_http))
+            .route("/cert/karaok-party-ca.pem", get(handle_ca_cert_pem_http))
+            .with_state(cert_state);
 
         let handle = axum_server::Handle::new();
         let server_handle = handle.clone();
@@ -123,6 +148,22 @@ impl MicServer {
             }
         });
 
+        // Plain-HTTP CA onboarding server (serves ONLY public CA cert — zero red warning on iPhone)
+        let cert_http_port = port.checked_add(1).unwrap_or(DEFAULT_CERT_HTTP_PORT);
+        let cert_http_handle = axum_server::Handle::new();
+        let cert_srv_handle = cert_http_handle.clone();
+        let cert_addr = SocketAddr::from(([0, 0, 0, 0], cert_http_port));
+        tokio::spawn(async move {
+            info!("Karaok Party HTTP CA Onboarding listening on http://{cert_addr}/cert/install");
+            if let Err(err) = axum_server::bind(cert_addr)
+                .handle(cert_srv_handle)
+                .serve(cert_http_app.into_make_service())
+                .await
+            {
+                warn!("HTTP CA onboarding server exited: {err}");
+            }
+        });
+
         let mdns_daemon = register_mdns_service(lan_ip, port);
 
         // Prefer LAN IP in QR URLs for 100% reliability on iOS Wi-Fi routers that block mDNS,
@@ -133,7 +174,7 @@ impl MicServer {
             lan_ip.to_string()
         };
         let server_url = format!("https://{host_for_qr}:{port}");
-        let ca_cert_url = format!("{server_url}/cert/install");
+        let ca_cert_url = format!("http://{host_for_qr}:{cert_http_port}/cert/install");
         let mic1_url = format!("{server_url}/mic/1?token={session_token}");
         let mic2_url = format!("{server_url}/mic/2?token={session_token}");
 
@@ -142,6 +183,7 @@ impl MicServer {
             mdns_hostname: format!("https://{MDNS_HOSTNAME}:{port}"),
             lan_ip: lan_ip.to_string(),
             port,
+            ca_cert_qr_svg: generate_qr_svg(&ca_cert_url, "#0f172a"),
             ca_cert_url,
             mic1_qr_svg: generate_qr_svg(&mic1_url, "#0284c7"),
             mic2_qr_svg: generate_qr_svg(&mic2_url, "#e11d48"),
@@ -155,6 +197,7 @@ impl MicServer {
                 pairing_info,
                 _mdns_daemon: mdns_daemon,
                 handle,
+                cert_http_handle,
             },
             queue_rx,
         ))
@@ -166,6 +209,7 @@ impl MicServer {
 
     pub fn shutdown(&self) {
         self.handle.shutdown();
+        self.cert_http_handle.shutdown();
     }
 }
 
@@ -223,7 +267,37 @@ async fn handle_cert_install_page() -> Response {
     Html(CERT_INSTALL_HTML).into_response()
 }
 
+async fn handle_ca_cert_der_https(State(state): State<ServerState>) -> Response {
+    ca_cert_der_response(state.ca_cert_der)
+}
+
+async fn handle_ca_cert_der_http(State(state): State<CertOnboardingState>) -> Response {
+    ca_cert_der_response(state.ca_cert_der)
+}
+
+async fn handle_ca_cert_pem_http(State(state): State<CertOnboardingState>) -> Response {
+    ca_cert_pem_response(state.ca_cert_pem)
+}
+
 async fn handle_ca_cert_download(State(state): State<ServerState>) -> Response {
+    ca_cert_pem_response(state.ca_cert_pem)
+}
+
+fn ca_cert_der_response(der: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/x-x509-ca-cert"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"karaok-party-ca.cer\"",
+            ),
+        ],
+        der,
+    )
+        .into_response()
+}
+
+fn ca_cert_pem_response(pem: String) -> Response {
     (
         [
             (header::CONTENT_TYPE, "application/x-pem-file"),
@@ -232,7 +306,7 @@ async fn handle_ca_cert_download(State(state): State<ServerState>) -> Response {
                 "attachment; filename=\"karaok-party-ca.pem\"",
             ),
         ],
-        state.ca_cert_pem,
+        pem,
     )
         .into_response()
 }
@@ -368,6 +442,7 @@ mod tests {
         let state = ServerState {
             session_token: "secret-token-123".into(),
             ca_cert_pem: String::new(),
+            ca_cert_der: vec![0x30, 0x00],
             engine_state: engine.state(),
             mic_producers: [Arc::new(Mutex::new(p1)), Arc::new(Mutex::new(p2))],
             queue_tx: tx,
@@ -400,5 +475,19 @@ mod tests {
         )
         .await;
         assert_eq!(ok.status(), StatusCode::OK);
+
+        let cer_resp = handle_ca_cert_der_http(State(CertOnboardingState {
+            ca_cert_pem: String::new(),
+            ca_cert_der: vec![0x30, 0x82],
+        }))
+        .await;
+        assert_eq!(cer_resp.status(), StatusCode::OK);
+        assert_eq!(
+            cer_resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-x509-ca-cert")
+        );
     }
 }
