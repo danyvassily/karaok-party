@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LyricsStage } from "./components/LyricsStage";
-import { DEFAULT_TELEMETRY, karaokApi } from "./lib/tauri";
+import { DEFAULT_TELEMETRY, isTauriRuntime, karaokApi } from "./lib/tauri";
 import type { LyricsDocument, PlaybackTelemetry, QueueItem, Track } from "./types/karaok";
 
 /**
@@ -68,8 +69,16 @@ export default function TvApp() {
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#05060A] bg-[radial-gradient(ellipse_at_center,_rgba(56,189,248,0.10),_transparent_70%)] text-slate-50">
-      {/* Minimal TV Header: Current Song & Upcoming Singer */}
-      <header className="flex items-center justify-between px-10 py-6">
+      {/* Minimal TV Header: Current Song & Upcoming Singer (draggable to external TV/AirPlay) */}
+      <header
+        data-tauri-drag-region
+        onMouseDown={(e) => {
+          if (isTauriRuntime() && e.buttons === 1) {
+            void getCurrentWindow().startDragging();
+          }
+        }}
+        className="flex cursor-grab items-center justify-between px-10 py-6 active:cursor-grabbing"
+      >
         <div>
           <p className="text-lg font-bold text-slate-100">
             {activeTrack ? activeTrack.title : "Karaok Party"}

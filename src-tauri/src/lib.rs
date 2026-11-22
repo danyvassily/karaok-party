@@ -147,6 +147,7 @@ pub fn run() {
             commands::get_lyrics,
             commands::save_lyrics,
             commands::fetch_lrclib_lyrics,
+            commands::open_google_lyrics_search,
             commands::auto_align_lyrics_whisper,
             commands::shift_lyrics_offset,
             commands::list_queue,

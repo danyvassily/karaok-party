@@ -218,6 +218,13 @@ export const karaokApi = {
       durationSecs: durationSecs ?? null,
     }),
 
+  openGoogleLyricsSearch: (title: string, artist: string) =>
+    isTauriRuntime()
+      ? invoke<string>("open_google_lyrics_search", { title, artist })
+      : Promise.resolve(
+          `https://www.google.com/search?q=${encodeURIComponent(`${artist} ${title} paroles lyrics`)}`
+        ),
+
   autoAlignLyricsWhisper: (trackId: string, plainLyrics: string) =>
     invoke<LyricsDocument>("auto_align_lyrics_whisper", { trackId, plainLyrics }),
 

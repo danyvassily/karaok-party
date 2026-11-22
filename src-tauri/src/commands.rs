@@ -3,15 +3,15 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use karaok_ai::{
-    align_plain_lyrics_to_vocals, compute_file_sha256, import_spotify_playlist_metadata,
-    import_youtube_audio, separate_track_chunked, LrclibClient, PlaylistTrackCandidate,
-    WhisperAlignConfig,
+    align_plain_lyrics_to_vocals, build_google_lyrics_url, compute_file_sha256,
+    import_spotify_playlist_metadata, import_youtube_audio, separate_track_chunked, LrclibClient,
+    PlaylistTrackCandidate, WhisperAlignConfig,
 };
 use karaok_audio::{decode_audio_to_48khz_stereo, mix_and_export_recording, AudioEngine};
 use karaok_core::{
-    DemucsModel, LoopRegion, LyricsDocument, MicChannelId, MicPairingInfo, MusicalKey,
-    PlaybackTelemetry, QueueItem, QueueMode, RecordingEntry, StemMix, StemStatus, Track,
-    TrackSource, VocalDspParams, VocalPreset,
+    DemucsModel, LoopRegion, LyricsDocument, LyricsFormat, MicChannelId, MicPairingInfo,
+    MusicalKey, PlaybackTelemetry, QueueItem, QueueMode, RecordingEntry, StemMix, StemStatus,
+    Track, TrackSource, VocalDspParams, VocalPreset,
 };
 use karaok_db::KaraokDatabase;
 use karaok_mic_server::MicServer;
@@ -103,7 +103,7 @@ pub async fn import_local_file(
 
     state.db.upsert_track(&track).await.map_err(|e| e.to_string())?;
 
-    // Best-effort automatic LRCLIB fetch in background
+    // Best-effort automatic multi-source Web/LRCLIB fetch + AI alignment in background
     let db = state.db.clone();
     let lrclib = state.lrclib.clone();
     let t_title = track.title.clone();
@@ -112,7 +112,8 @@ pub async fn import_local_file(
     let tid = track_id.clone();
     let app_clone = app.clone();
     tokio::spawn(async move {
-        if let Ok(doc) = lrclib.fetch_best_lyrics(&t_title, &t_artist, t_dur).await {
+        if let Ok(raw_doc) = lrclib.fetch_best_lyrics(&t_title, &t_artist, t_dur).await {
+            let doc = auto_align_if_plain(raw_doc, &tid, &db).await;
             if db.save_lyrics(&tid, &doc).await.is_ok() {
                 let _ = app_clone.emit("lyrics-updated", &tid);
             }
@@ -166,7 +167,7 @@ pub async fn import_youtube_url(
 
     state.db.upsert_track(&track).await.map_err(|e| e.to_string())?;
 
-    // Kick off automatic LRCLIB lookup
+    // Kick off automatic multi-source Web/LRCLIB lookup + AI alignment
     let db = state.db.clone();
     let lrclib = state.lrclib.clone();
     let tid = track.id.clone();
@@ -175,7 +176,8 @@ pub async fn import_youtube_url(
     let dur = Some(track.duration_ms / 1000);
     let app_clone = app.clone();
     tokio::spawn(async move {
-        if let Ok(doc) = lrclib.fetch_best_lyrics(&t_title, &t_artist, dur).await {
+        if let Ok(raw_doc) = lrclib.fetch_best_lyrics(&t_title, &t_artist, dur).await {
+            let doc = auto_align_if_plain(raw_doc, &tid, &db).await;
             if db.save_lyrics(&tid, &doc).await.is_ok() {
                 let _ = app_clone.emit("lyrics-updated", &tid);
             }
@@ -445,6 +447,42 @@ pub async fn save_lyrics(
     Ok(doc)
 }
 
+async fn auto_align_if_plain(
+    doc: LyricsDocument,
+    track_id: &str,
+    db: &KaraokDatabase,
+) -> LyricsDocument {
+    if doc.format != LyricsFormat::Plain || doc.lines.is_empty() {
+        return doc;
+    }
+    let Ok(track) = db.get_track(track_id).await else {
+        return doc;
+    };
+    let plain_text = doc
+        .lines
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let audio_path = track
+        .stems_dir
+        .as_ref()
+        .map(|d| PathBuf::from(d).join("vocals.wav"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(&track.source_path));
+    if !audio_path.exists() {
+        return doc;
+    }
+    match tokio::task::spawn_blocking(move || {
+        align_plain_lyrics_to_vocals(&audio_path, &plain_text, &WhisperAlignConfig::default())
+    })
+    .await
+    {
+        Ok(Ok(aligned)) => aligned,
+        _ => doc,
+    }
+}
+
 #[tauri::command]
 pub async fn fetch_lrclib_lyrics(
     track_id: String,
@@ -454,11 +492,13 @@ pub async fn fetch_lrclib_lyrics(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<LyricsDocument, String> {
-    let doc = state
+    let raw_doc = state
         .lrclib
         .fetch_best_lyrics(&title, &artist, duration_secs)
         .await
         .map_err(|e| e.to_string())?;
+    let doc = auto_align_if_plain(raw_doc, &track_id, &state.db).await;
+
     state
         .db
         .save_lyrics(&track_id, &doc)
@@ -466,6 +506,16 @@ pub async fn fetch_lrclib_lyrics(
         .map_err(|e| e.to_string())?;
     let _ = app.emit("lyrics-updated", &track_id);
     Ok(doc)
+}
+
+#[tauri::command]
+pub fn open_google_lyrics_search(title: String, artist: String) -> Result<String, String> {
+    let url = build_google_lyrics_url(&title, &artist);
+    std::process::Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map_err(|e| format!("Impossible d'ouvrir le navigateur : {e}"))?;
+    Ok(url)
 }
 
 #[tauri::command]

@@ -12,6 +12,8 @@ interface LyricsStageProps {
   trackTitle?: string;
   trackArtist?: string;
   onOpenSync?: () => void;
+  onFetchWebLyrics?: () => void;
+  onSearchGoogle?: () => void;
 }
 
 export function LyricsStage({
@@ -24,6 +26,8 @@ export function LyricsStage({
   trackTitle,
   trackArtist,
   onOpenSync,
+  onFetchWebLyrics,
+  onSearchGoogle,
 }: LyricsStageProps) {
   const stage = useMemo(
     () => computeStageLyricsState(lyrics, positionMs),
@@ -54,14 +58,36 @@ export function LyricsStage({
               ? `Aucune parole synchronisée pour « ${trackTitle} » (${trackArtist ?? "Artiste"}).`
               : "Importez un morceau local ou YouTube depuis la bibliothèque, puis scannez le QR Code avec votre iPhone."}
           </p>
-          {trackTitle && onOpenSync && (
-            <button
-              type="button"
-              onClick={onOpenSync}
-              className="mt-2 inline-flex items-center gap-2 rounded-xl bg-sky-400 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300"
-            >
-              Synchroniser les paroles (LRCLIB / Whisper)
-            </button>
+          {trackTitle && (onFetchWebLyrics || onSearchGoogle || onOpenSync) && (
+            <div className="mt-3 flex flex-wrap items-center justify-center gap-2.5">
+              {onFetchWebLyrics && (
+                <button
+                  type="button"
+                  onClick={onFetchWebLyrics}
+                  className="inline-flex items-center gap-2 rounded-xl bg-sky-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300"
+                >
+                  Rechercher les paroles (Web + IA)
+                </button>
+              )}
+              {onSearchGoogle && (
+                <button
+                  type="button"
+                  onClick={onSearchGoogle}
+                  className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/8 px-4 py-2.5 text-sm font-semibold text-slate-100 transition hover:bg-white/15"
+                >
+                  Chercher sur Google
+                </button>
+              )}
+              {onOpenSync && (
+                <button
+                  type="button"
+                  onClick={onOpenSync}
+                  className="inline-flex items-center gap-2 rounded-xl border border-white/10 px-4 py-2.5 text-sm font-medium text-slate-300 transition hover:bg-white/8"
+                >
+                  Éditeur Sync
+                </button>
+              )}
+            </div>
           )}
         </div>
       </div>

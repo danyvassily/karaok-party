@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CloudDownload, Save, Sparkles, Timer, Wand2, X } from "lucide-react";
+import { CloudDownload, ExternalLink, Save, Sparkles, Timer, Wand2, X } from "lucide-react";
 import { formatLrcTimestamp, serializeEnhancedLrc } from "../lib/lyricsEngine";
 import type { LyricsDocument, LyricsLine, Track } from "../types/karaok";
 
@@ -9,6 +9,7 @@ interface SyncLyricsEditorProps {
   positionMs: number;
   onClose: () => void;
   onFetchLrclib: () => Promise<void>;
+  onSearchGoogle: () => Promise<void>;
   onAutoAlignWhisper: (plainLyrics: string) => Promise<void>;
   onShiftOffset: (deltaMs: number) => Promise<void>;
   onSaveLyrics: (doc: LyricsDocument) => Promise<void>;
@@ -20,6 +21,7 @@ export function SyncLyricsEditor({
   positionMs,
   onClose,
   onFetchLrclib,
+  onSearchGoogle,
   onAutoAlignWhisper,
   onShiftOffset,
   onSaveLyrics,
@@ -160,7 +162,27 @@ export function SyncLyricsEditor({
             className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-slate-100 hover:bg-white/10 disabled:opacity-50"
           >
             <CloudDownload className="h-3.5 w-3.5 text-sky-400" />
-            {busy === "lrclib" ? "Recherche..." : "Chercher LRCLIB"}
+            {busy === "lrclib" ? "Recherche Web..." : "Chercher Web + LRCLIB"}
+          </button>
+
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={async () => {
+              setFeedback(null);
+              try {
+                await onSearchGoogle();
+                setFeedback(
+                  "Recherche Google ouverte dans votre navigateur. Copiez-collez les paroles à gauche puis cliquez sur « Aligner mot-à-mot »."
+                );
+              } catch (err) {
+                setFeedback(String(err));
+              }
+            }}
+            className="flex items-center gap-1.5 rounded-xl border border-amber-400/35 bg-amber-400/12 px-3 py-2 text-xs font-semibold text-amber-200 hover:bg-amber-400/20 disabled:opacity-50"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            Chercher sur Google
           </button>
 
           <button

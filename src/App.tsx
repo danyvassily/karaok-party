@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Activity, AlignLeft, PanelLeft, PanelLeftClose, Upload } from "lucide-react";
 import { LeftSidebar } from "./components/LeftSidebar";
@@ -344,16 +345,27 @@ export default function App() {
     return karaokApi.exportRecordingMix(recordingId, vocalBalance, dest);
   };
 
+  const handleHeaderMouseDown = (e: React.MouseEvent<HTMLElement>) => {
+    if (!isTauriRuntime() || e.buttons !== 1) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("button, input, a, select, textarea")) return;
+    void getCurrentWindow().startDragging();
+  };
+
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#07080C] text-slate-50">
-      {/* Top Studio Bar (macOS Overlay Titlebar safe padding on left for traffic lights) */}
-      <header className="titlebar-drag flex h-12 shrink-0 items-center justify-between border-b border-white/8 bg-[#0B0D14] pl-20 pr-4">
-        <div className="titlebar-no-drag flex items-center gap-3">
+      {/* Top Studio Bar — native macOS draggable via data-tauri-drag-region + startDragging() */}
+      <header
+        data-tauri-drag-region
+        onMouseDown={handleHeaderMouseDown}
+        className="titlebar-drag flex h-12 shrink-0 cursor-grab items-center justify-between border-b border-white/8 bg-[#0B0D14] pl-20 pr-4 active:cursor-grabbing"
+      >
+        <div data-tauri-drag-region className="flex items-center gap-3">
           <button
             type="button"
             onClick={() => setSidebarOpen((v) => !v)}
             title={sidebarOpen ? "Masquer la bibliothèque" : "Afficher la bibliothèque"}
-            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-slate-100"
+            className="titlebar-no-drag rounded-lg p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-slate-100"
           >
             {sidebarOpen ? (
               <PanelLeftClose className="h-4 w-4" />
@@ -361,15 +373,26 @@ export default function App() {
               <PanelLeft className="h-4 w-4" />
             )}
           </button>
-          <span className="text-sm font-bold tracking-tight text-slate-100">
+          <span
+            data-tauri-drag-region
+            className="select-none text-sm font-bold tracking-tight text-slate-100"
+          >
             Karaok Party
           </span>
           {activeTrack && (
-            <div className="hidden items-center gap-2 border-l border-white/10 pl-3 md:flex">
-              <span className="max-w-xs truncate text-xs font-semibold text-slate-200">
+            <div
+              data-tauri-drag-region
+              className="hidden select-none items-center gap-2 border-l border-white/10 pl-3 md:flex"
+            >
+              <span
+                data-tauri-drag-region
+                className="max-w-xs truncate text-xs font-semibold text-slate-200"
+              >
                 {activeTrack.title}
               </span>
-              <span className="text-xs text-slate-400">— {activeTrack.artist}</span>
+              <span data-tauri-drag-region className="text-xs text-slate-400">
+                — {activeTrack.artist}
+              </span>
               {currentSingerBanner && (
                 <span className="rounded-full bg-sky-400/15 px-2.5 py-0.5 text-[11px] font-semibold text-sky-300">
                   {currentSingerBanner}
@@ -448,6 +471,10 @@ export default function App() {
                 );
                 setLyrics(doc);
               }}
+              onSearchGoogle={async () => {
+                if (!activeTrack) return;
+                await karaokApi.openGoogleLyricsSearch(activeTrack.title, activeTrack.artist);
+              }}
               onAutoAlignWhisper={async (plain) => {
                 if (!activeTrack) return;
                 const doc = await karaokApi.autoAlignLyricsWhisper(activeTrack.id, plain);
@@ -474,6 +501,25 @@ export default function App() {
               trackTitle={activeTrack?.title}
               trackArtist={activeTrack?.artist}
               onOpenSync={() => setSyncMode(true)}
+              onFetchWebLyrics={async () => {
+                if (!activeTrack) return;
+                try {
+                  const doc = await karaokApi.fetchLrclibLyrics(
+                    activeTrack.id,
+                    activeTrack.title,
+                    activeTrack.artist,
+                    Math.round(activeTrack.durationMs / 1000)
+                  );
+                  setLyrics(doc);
+                } catch {
+                  setSyncMode(true);
+                }
+              }}
+              onSearchGoogle={async () => {
+                if (!activeTrack) return;
+                await karaokApi.openGoogleLyricsSearch(activeTrack.title, activeTrack.artist);
+                setSyncMode(true);
+              }}
             />
           )}
         </main>
