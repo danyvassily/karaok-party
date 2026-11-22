@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { computeStageLyricsState, midiToNoteLabel } from "../lib/lyricsEngine";
 import type { LyricsDocument, LyricsLine, MicTelemetry } from "../types/karaok";
 
@@ -9,11 +9,13 @@ interface LyricsStageProps {
   mic2: MicTelemetry;
   showPitchGauge: boolean;
   tvMode?: boolean;
+  trackId?: string;
   trackTitle?: string;
   trackArtist?: string;
   onOpenSync?: () => void;
-  onFetchWebLyrics?: () => void;
-  onSearchGoogle?: () => void;
+  onFetchWebLyrics?: () => Promise<void>;
+  onSearchGoogle?: () => Promise<void>;
+  onSavePastedLyrics?: (plainText: string) => Promise<void>;
 }
 
 export function LyricsStage({
@@ -23,12 +25,26 @@ export function LyricsStage({
   mic2,
   showPitchGauge,
   tvMode = false,
+  trackId,
   trackTitle,
   trackArtist,
   onOpenSync,
   onFetchWebLyrics,
   onSearchGoogle,
+  onSavePastedLyrics,
 }: LyricsStageProps) {
+  const [showPasteBox, setShowPasteBox] = useState(false);
+  const [pastedText, setPastedText] = useState("");
+  const [busyAction, setBusyAction] = useState<"web" | "save" | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    setShowPasteBox(false);
+    setPastedText("");
+    setStatusMessage(null);
+    setBusyAction(null);
+  }, [trackId]);
+
   const stage = useMemo(
     () => computeStageLyricsState(lyrics, positionMs),
     [lyrics, positionMs]
@@ -48,44 +64,124 @@ export function LyricsStage({
 
   if (!lyrics || lyrics.lines.length === 0) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center px-8 text-center">
-        <div className="max-w-lg space-y-4">
+      <div className="flex flex-1 flex-col items-center justify-center overflow-y-auto px-8 py-6 text-center">
+        <div className="w-full max-w-xl space-y-4">
           <p className="text-3xl font-semibold tracking-tight text-slate-100">
             {trackTitle ? trackTitle : "Prêt à chanter"}
           </p>
-          <p className="text-base text-slate-400">
+          <p className="text-sm text-slate-400">
             {trackTitle
-              ? `Aucune parole synchronisée pour « ${trackTitle} » (${trackArtist ?? "Artiste"}).`
-              : "Importez un morceau local ou YouTube depuis la bibliothèque, puis scannez le QR Code avec votre iPhone."}
+              ? `Aucune parole enregistrée dans votre bibliothèque pour « ${trackTitle} » (${trackArtist ?? "Artiste"}).`
+              : "Lancez un morceau depuis la bibliothèque : ses paroles enregistrées s'afficheront automatiquement ici."}
           </p>
-          {trackTitle && (onFetchWebLyrics || onSearchGoogle || onOpenSync) && (
-            <div className="mt-3 flex flex-wrap items-center justify-center gap-2.5">
-              {onFetchWebLyrics && (
-                <button
-                  type="button"
-                  onClick={onFetchWebLyrics}
-                  className="inline-flex items-center gap-2 rounded-xl bg-sky-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300"
-                >
-                  Rechercher les paroles (Web + IA)
-                </button>
+
+          {trackTitle && !tvMode && (
+            <div className="space-y-4 pt-1">
+              <div className="flex flex-wrap items-center justify-center gap-2.5">
+                {onSearchGoogle && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setShowPasteBox(true);
+                      setStatusMessage(
+                        "Google est ouvert : copiez les paroles puis collez-les ci-dessous pour les enregistrer définitivement avec cette musique."
+                      );
+                      await onSearchGoogle();
+                    }}
+                    className="inline-flex items-center gap-2 rounded-xl bg-sky-400 px-4 py-2.5 text-sm font-bold text-slate-950 transition hover:bg-sky-300"
+                  >
+                    Chercher sur Google
+                  </button>
+                )}
+
+                {onSavePastedLyrics && (
+                  <button
+                    type="button"
+                    onClick={() => setShowPasteBox((v) => !v)}
+                    className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/8 px-4 py-2.5 text-sm font-semibold text-slate-100 transition hover:bg-white/15"
+                  >
+                    Coller / Écrire moi-même
+                  </button>
+                )}
+
+                {onFetchWebLyrics && (
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={async () => {
+                      setBusyAction("web");
+                      setStatusMessage(null);
+                      try {
+                        await onFetchWebLyrics();
+                      } catch (err) {
+                        setShowPasteBox(true);
+                        setStatusMessage(String(err));
+                      } finally {
+                        setBusyAction(null);
+                      }
+                    }}
+                    className="inline-flex items-center gap-2 rounded-xl border border-white/10 px-4 py-2.5 text-sm font-medium text-slate-300 transition hover:bg-white/8 disabled:opacity-50"
+                  >
+                    {busyAction === "web" ? "Recherche en cours..." : "Recherche auto"}
+                  </button>
+                )}
+              </div>
+
+              {statusMessage && (
+                <p className="rounded-xl bg-sky-500/10 px-4 py-2.5 text-xs text-sky-200">
+                  {statusMessage}
+                </p>
               )}
-              {onSearchGoogle && (
-                <button
-                  type="button"
-                  onClick={onSearchGoogle}
-                  className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-white/8 px-4 py-2.5 text-sm font-semibold text-slate-100 transition hover:bg-white/15"
-                >
-                  Chercher sur Google
-                </button>
-              )}
-              {onOpenSync && (
-                <button
-                  type="button"
-                  onClick={onOpenSync}
-                  className="inline-flex items-center gap-2 rounded-xl border border-white/10 px-4 py-2.5 text-sm font-medium text-slate-300 transition hover:bg-white/8"
-                >
-                  Éditeur Sync
-                </button>
+
+              {showPasteBox && onSavePastedLyrics && (
+                <div className="space-y-3 rounded-2xl border border-white/10 bg-[#11131B] p-4 text-left shadow-xl">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-200">
+                      Collez ou écrivez les paroles (liées définitivement à « {trackTitle} »)
+                    </span>
+                    {onOpenSync && (
+                      <button
+                        type="button"
+                        onClick={onOpenSync}
+                        className="text-[11px] font-medium text-sky-400 hover:underline"
+                      >
+                        Éditeur avancé
+                      </button>
+                    )}
+                  </div>
+                  <textarea
+                    rows={7}
+                    value={pastedText}
+                    onChange={(e) => setPastedText(e.target.value)}
+                    placeholder="Collez ici les paroles copiées depuis Google (ou un texte .lrc)..."
+                    className="w-full resize-none rounded-xl border border-white/10 bg-[#07080C] p-3 text-sm leading-relaxed text-slate-100 placeholder:text-slate-500 focus:border-sky-400/60 focus:outline-none"
+                  />
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-400">
+                      Synchronisation automatique IA + sauvegarde permanente SQLite
+                    </span>
+                    <button
+                      type="button"
+                      disabled={busyAction !== null || !pastedText.trim()}
+                      onClick={async () => {
+                        setBusyAction("save");
+                        setStatusMessage(null);
+                        try {
+                          await onSavePastedLyrics(pastedText);
+                        } catch (err) {
+                          setStatusMessage(String(err));
+                        } finally {
+                          setBusyAction(null);
+                        }
+                      }}
+                      className="rounded-xl bg-emerald-400 px-4 py-2 text-xs font-bold text-slate-950 transition hover:bg-emerald-300 disabled:opacity-40"
+                    >
+                      {busyAction === "save"
+                        ? "Sauvegarde & Sync..."
+                        : "Enregistrer dans la bibliothèque"}
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
           )}

@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { Mic, MicOff, ShieldCheck, Sliders, X } from "lucide-react";
+import { Mic, MicOff, RefreshCw, Sliders, Smartphone, X } from "lucide-react";
 import type {
+  ActiveMicInputs,
+  AudioInputDeviceInfo,
   MicChannelId,
-  MicPairingInfo,
   MicTelemetry,
   ScaleType,
   VocalDspParams,
@@ -11,7 +12,9 @@ import type {
 
 interface VoiceMicDrawerProps {
   open: boolean;
-  pairingInfo: MicPairingInfo | null;
+  inputDevices: AudioInputDeviceInfo[];
+  activeMicInputs: ActiveMicInputs;
+  micError: string | null;
   mic1Telemetry: MicTelemetry;
   mic2Telemetry: MicTelemetry;
   mic1Params: VocalDspParams;
@@ -19,6 +22,8 @@ interface VoiceMicDrawerProps {
   latencyCalibrationMs: number;
   bufferSize: string;
   onClose: () => void;
+  onRefreshDevices: () => void;
+  onSelectInputDevice: (ch: MicChannelId, deviceName: string | null) => void;
   onSelectPreset: (ch: MicChannelId, preset: VocalPreset) => void;
   onUpdateParams: (ch: MicChannelId, params: VocalDspParams) => void;
   onSetLatencyMs: (ms: number) => void;
@@ -34,7 +39,9 @@ const PRESETS: { id: VocalPreset; label: string; desc: string }[] = [
 
 export function VoiceMicDrawer({
   open,
-  pairingInfo,
+  inputDevices,
+  activeMicInputs,
+  micError,
   mic1Telemetry,
   mic2Telemetry,
   mic1Params,
@@ -42,6 +49,8 @@ export function VoiceMicDrawer({
   latencyCalibrationMs,
   bufferSize,
   onClose,
+  onRefreshDevices,
+  onSelectInputDevice,
   onSelectPreset,
   onUpdateParams,
   onSetLatencyMs,
@@ -52,6 +61,7 @@ export function VoiceMicDrawer({
 
   const activeParams = activeMic === "mic1" ? mic1Params : mic2Params;
   const isExpert = activeParams.preset === "expert";
+  const detectedIphone = inputDevices.find((d) => d.isIphone);
 
   const patchParam = <K extends keyof VocalDspParams>(key: K, value: VocalDspParams[K]) => {
     onUpdateParams(activeMic, { ...activeParams, [key]: value });
@@ -63,84 +73,99 @@ export function VoiceMicDrawer({
       <div className="flex items-center justify-between border-b border-white/8 px-5 py-4">
         <div>
           <h2 className="text-sm font-bold text-slate-50">
-            Voix & Microphones iPhone (Mode Duo)
+            Voix & Micros (iPhone connecté au Mac)
           </h2>
           <p className="text-xs text-slate-400">
-            Sans application iOS · HTTPS/WSS local · CoreAudio 48 kHz ({bufferSize.replace("Frames", "")} éch.)
+            Connexion directe CoreAudio · 48 kHz ({bufferSize.replace("Frames", "")} éch.) · Sans QR Code
           </p>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Fermer le tiroir micros"
-          className="rounded-lg p-1.5 text-slate-400 hover:bg-white/10 hover:text-slate-100"
-        >
-          <X className="h-4 w-4" />
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={onRefreshDevices}
+            title="Actualiser la liste des micros et iPhones connectés"
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-white/10 hover:text-sky-300"
+          >
+            <RefreshCw className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Fermer le tiroir micros"
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-white/10 hover:text-slate-100"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 space-y-5 overflow-y-auto p-5">
-        {/* Pairing Cards: Mic 1 (Blue) & Mic 2 (Coral) */}
-        <section className="grid grid-cols-2 gap-3">
-          <MicCard
+        {/* Direct Connected iPhone Status Banner */}
+        <section className="rounded-xl border border-sky-400/25 bg-sky-500/8 p-3.5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <Smartphone className="mt-0.5 h-4 w-4 shrink-0 text-sky-400" />
+              <div className="space-y-0.5">
+                <p className="text-xs font-bold text-slate-100">
+                  {detectedIphone
+                    ? `iPhone détecté : ${detectedIphone.name}`
+                    : "Branchez ou approchez votre iPhone du Mac"}
+                </p>
+                <p className="text-[11px] leading-relaxed text-slate-300">
+                  {detectedIphone
+                    ? "Sélectionnez-le directement ci-dessous comme Micro 1 ou Micro 2 (latence native < 5 ms)."
+                    : "Activez « Appareil photo Continuité » sur l'iPhone ou branchez-le en USB au Mac, puis cliquez sur Actualiser."}
+                </p>
+              </div>
+            </div>
+            {detectedIphone && activeMicInputs.mic1Device !== detectedIphone.name && (
+              <button
+                type="button"
+                onClick={() => onSelectInputDevice("mic1", detectedIphone.name)}
+                className="shrink-0 rounded-lg bg-sky-400 px-3 py-1.5 text-xs font-bold text-slate-950 transition hover:bg-sky-300"
+              >
+                Connecter
+              </button>
+            )}
+          </div>
+        </section>
+
+        {micError && (
+          <p className="rounded-lg bg-rose-500/15 px-3 py-2 text-xs text-rose-300">
+            {micError}
+          </p>
+        )}
+
+        {/* Direct CoreAudio Input Cards: Mic 1 (Blue) & Mic 2 (Coral) */}
+        <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <MicInputCard
             label="Micro 1 (Bleu)"
             accent="sky"
             selected={activeMic === "mic1"}
+            selectedDevice={activeMicInputs.mic1Device}
+            devices={inputDevices}
             telemetry={mic1Telemetry}
             params={mic1Params}
-            qrSvg={pairingInfo?.mic1QrSvg ?? null}
-            url={pairingInfo?.mic1Url ?? "https://karaok-party.local:8443/mic/1"}
-            onSelect={() => setActiveMic("mic1")}
+            onSelectCard={() => setActiveMic("mic1")}
+            onChangeDevice={(name) => onSelectInputDevice("mic1", name)}
             onToggleMute={() =>
               onUpdateParams("mic1", { ...mic1Params, muted: !mic1Params.muted })
             }
           />
-          <MicCard
+          <MicInputCard
             label="Micro 2 (Corail)"
             accent="coral"
             selected={activeMic === "mic2"}
+            selectedDevice={activeMicInputs.mic2Device}
+            devices={inputDevices}
             telemetry={mic2Telemetry}
             params={mic2Params}
-            qrSvg={pairingInfo?.mic2QrSvg ?? null}
-            url={pairingInfo?.mic2Url ?? "https://karaok-party.local:8443/mic/2"}
-            onSelect={() => setActiveMic("mic2")}
+            onSelectCard={() => setActiveMic("mic2")}
+            onChangeDevice={(name) => onSelectInputDevice("mic2", name)}
             onToggleMute={() =>
               onUpdateParams("mic2", { ...mic2Params, muted: !mic2Params.muted })
             }
           />
-        </section>
-
-        {/* 1-tap iPhone Local CA Certificate Helper (plain HTTP :8444 — zero red TLS warning) */}
-        <section className="rounded-xl border border-sky-400/25 bg-sky-500/8 p-3.5">
-          <div className="flex items-center gap-3">
-            {pairingInfo?.caCertQrSvg && (
-              <div className="h-24 w-24 shrink-0 overflow-hidden rounded-lg bg-white p-1.5">
-                <img
-                  src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(
-                    pairingInfo.caCertQrSvg
-                  )}`}
-                  alt="QR Code installation certificat iPhone"
-                  className="h-full w-full object-contain"
-                />
-              </div>
-            )}
-            <div className="min-w-0 flex-1 space-y-1.5">
-              <div className="flex items-center gap-1.5">
-                <ShieldCheck className="h-4 w-4 shrink-0 text-sky-400" />
-                <p className="text-xs font-bold text-slate-100">
-                  1re connexion iPhone (Sans avertissement)
-                </p>
-              </div>
-              <p className="text-[11px] leading-relaxed text-slate-300">
-                Scannez ce QR (ouvrir dans <strong>Safari</strong>) ou visitez{" "}
-                <code className="rounded bg-black/40 px-1.5 py-0.5 text-[10px] text-sky-300 break-all">
-                  {pairingInfo?.caCertUrl ?? "http://karaok-party.local:8444/cert/install"}
-                </code>{" "}
-                pour installer <strong>Karaok Party Local CA (.cer)</strong> en 1 tap, puis activez-le dans{" "}
-                <em>Réglages → Informations → Réglages des certificats</em>.
-              </p>
-            </div>
-          </div>
         </section>
 
         {/* Vocal Presets for selected microphone */}
@@ -326,38 +351,40 @@ export function VoiceMicDrawer({
   );
 }
 
-function MicCard({
+function MicInputCard({
   label,
   accent,
   selected,
+  selectedDevice,
+  devices,
   telemetry,
   params,
-  qrSvg,
-  url,
-  onSelect,
+  onSelectCard,
+  onChangeDevice,
   onToggleMute,
 }: {
   label: string;
   accent: "sky" | "coral";
   selected: boolean;
+  selectedDevice: string | null;
+  devices: AudioInputDeviceInfo[];
   telemetry: MicTelemetry;
   params: VocalDspParams;
-  qrSvg: string | null;
-  url: string;
-  onSelect: () => void;
+  onSelectCard: () => void;
+  onChangeDevice: (deviceName: string | null) => void;
   onToggleMute: () => void;
 }) {
   const vuPct = Math.max(0, Math.min(100, ((telemetry.vuDb + 60) / 60) * 100));
 
   return (
     <div
-      onClick={onSelect}
+      onClick={onSelectCard}
       role="button"
       tabIndex={0}
       onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") onSelect();
+        if (e.key === "Enter" || e.key === " ") onSelectCard();
       }}
-      className={`cursor-pointer rounded-2xl border p-3 transition ${
+      className={`cursor-pointer rounded-2xl border p-3.5 transition ${
         selected
           ? accent === "sky"
             ? "border-sky-400 bg-sky-500/10"
@@ -365,7 +392,7 @@ function MicCard({
           : "border-white/8 bg-[#11131B] hover:border-white/20"
       }`}
     >
-      <div className="mb-2 flex items-center justify-between">
+      <div className="mb-2.5 flex items-center justify-between">
         <span
           className={`text-xs font-bold ${
             accent === "sky" ? "text-sky-300" : "text-rose-300"
@@ -388,20 +415,21 @@ function MicCard({
         </button>
       </div>
 
-      {/* QR Code (safe data-URI img, zero dangerouslySetInnerHTML) */}
-      <div className="mx-auto mb-2.5 flex aspect-square w-36 items-center justify-center overflow-hidden rounded-xl bg-white p-2">
-        {qrSvg ? (
-          <img
-            src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(qrSvg)}`}
-            alt={`QR Code d'appairage ${label}`}
-            className="h-full w-full object-contain"
-          />
-        ) : (
-          <span className="px-2 text-center text-[10px] font-medium text-slate-600">
-            QR prêt au lancement Tauri ({url.slice(0, 26)}…)
-          </span>
-        )}
-      </div>
+      {/* Native CoreAudio Device Selector */}
+      <select
+        value={selectedDevice ?? ""}
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => onChangeDevice(e.target.value || null)}
+        aria-label={`Source audio ${label}`}
+        className="mb-3 w-full rounded-lg border border-white/12 bg-[#07080C] px-2.5 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+      >
+        <option value="">Désactivé</option>
+        {devices.map((dev) => (
+          <option key={dev.name} value={dev.name}>
+            {dev.isIphone ? `📱 ${dev.name}` : dev.name}
+          </option>
+        ))}
+      </select>
 
       {/* Live VU Bar & Connection state */}
       <div className="space-y-1.5">
@@ -414,11 +442,11 @@ function MicCard({
           />
         </div>
         <div className="flex items-center justify-between text-[10px] text-slate-400">
-          <span>
-            {telemetry.connected ? "iPhone connecté" : "En attente QR"}
+          <span className={telemetry.connected ? "font-semibold text-emerald-400" : ""}>
+            {telemetry.connected ? "Actif (CoreAudio)" : "Aucun micro"}
           </span>
           <span className="font-mono tabular-nums">
-            {telemetry.connected ? `${telemetry.jitterMs.toFixed(0)} ms` : "--"}
+            {telemetry.connected ? `${telemetry.vuDb.toFixed(0)} dB` : "--"}
           </span>
         </div>
       </div>

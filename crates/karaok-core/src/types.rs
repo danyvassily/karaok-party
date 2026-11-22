@@ -382,6 +382,26 @@ impl Default for PlaybackTelemetry {
     }
 }
 
+/// Native macOS CoreAudio input device discovered via `cpal` (Continuity iPhone Mic, USB iPhone,
+/// MacBook built-in microphone, USB audio interface, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInputDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+    pub is_iphone: bool,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Currently bound CoreAudio input devices for Mic 1 and Mic 2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveMicInputs {
+    pub mic1_device: Option<String>,
+    pub mic2_device: Option<String>,
+}
+
 /// Pairing information exposed by the local HTTPS/WSS microphone server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

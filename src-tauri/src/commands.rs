@@ -7,16 +7,17 @@ use karaok_ai::{
     import_spotify_playlist_metadata, import_youtube_audio, separate_track_chunked, LrclibClient,
     PlaylistTrackCandidate, WhisperAlignConfig,
 };
-use karaok_audio::{decode_audio_to_48khz_stereo, mix_and_export_recording, AudioEngine};
+use karaok_audio::{
+    decode_audio_to_48khz_stereo, list_audio_input_devices as enumerate_coreaudio_inputs,
+    mix_and_export_recording, AudioEngine, NativeMicInputManager,
+};
 use karaok_core::{
-    DemucsModel, LoopRegion, LyricsDocument, LyricsFormat, MicChannelId, MicPairingInfo,
-    MusicalKey, PlaybackTelemetry, QueueItem, QueueMode, RecordingEntry, StemMix, StemStatus,
-    Track, TrackSource, VocalDspParams, VocalPreset,
+    ActiveMicInputs, AudioInputDeviceInfo, DemucsModel, LoopRegion, LyricsDocument, LyricsFormat,
+    LyricsLine, LyricsSource, MicChannelId, MusicalKey, PlaybackTelemetry, QueueItem, QueueMode,
+    RecordingEntry, StemMix, StemStatus, Track, TrackSource, VocalDspParams, VocalPreset,
 };
 use karaok_db::KaraokDatabase;
-use karaok_mic_server::MicServer;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -29,7 +30,7 @@ pub struct AppState {
     pub recordings_dir: PathBuf,
     pub db: KaraokDatabase,
     pub audio: Arc<AudioEngine>,
-    pub mic_server: Arc<Mutex<Option<MicServer>>>,
+    pub mic_inputs: Arc<NativeMicInputManager>,
     pub lrclib: LrclibClient,
 }
 
@@ -379,15 +380,29 @@ pub fn get_telemetry(state: State<'_, AppState>) -> PlaybackTelemetry {
 }
 
 // -----------------------------------------------------------------------------
-// Wireless iPhone Microphones & Vocal DSP
+// Native macOS / Connected iPhone Microphones & Vocal DSP (No QR Code)
 // -----------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn get_mic_pairing_info(
+pub fn list_audio_input_devices() -> Vec<AudioInputDeviceInfo> {
+    enumerate_coreaudio_inputs()
+}
+
+#[tauri::command]
+pub fn select_mic_input_device(
+    channel: MicChannelId,
+    device_name: Option<String>,
     state: State<'_, AppState>,
-) -> Result<Option<MicPairingInfo>, String> {
-    let guard = state.mic_server.lock().await;
-    Ok(guard.as_ref().map(|s| s.pairing_info().clone()))
+) -> Result<ActiveMicInputs, String> {
+    state
+        .mic_inputs
+        .select_device(channel, device_name.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_active_mic_inputs(state: State<'_, AppState>) -> ActiveMicInputs {
+    state.mic_inputs.active_inputs()
 }
 
 #[tauri::command]
@@ -516,6 +531,73 @@ pub fn open_google_lyrics_search(title: String, artist: String) -> Result<String
         .spawn()
         .map_err(|e| format!("Impossible d'ouvrir le navigateur : {e}"))?;
     Ok(url)
+}
+
+#[tauri::command]
+pub async fn save_plain_lyrics_for_track(
+    track_id: String,
+    plain_lyrics: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<LyricsDocument, String> {
+    let trimmed = plain_lyrics.trim();
+    if trimmed.is_empty() {
+        return Err("Les paroles sont vides.".to_string());
+    }
+
+    // If user pasted an already-timed `.lrc` / Enhanced LRC text, keep its exact timestamps!
+    let parsed = LyricsDocument::parse(trimmed, LyricsSource::Manual);
+    let doc = if parsed.format != LyricsFormat::Plain {
+        parsed
+    } else {
+        // Auto-align raw pasted text word-by-word against vocals (or distribute evenly across track duration)
+        let aligned = auto_align_if_plain(parsed.clone(), &track_id, &state.db).await;
+        if aligned.format != LyricsFormat::Plain {
+            aligned
+        } else {
+            let duration_ms = state
+                .db
+                .get_track(&track_id)
+                .await
+                .map(|t| t.duration_ms.max(10_000))
+                .unwrap_or(180_000);
+            let lines_raw: Vec<&str> = trimmed
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            let count = lines_raw.len().max(1) as u64;
+            let step = (duration_ms / count).max(1500);
+            let lines = lines_raw
+                .into_iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let start_ms = (i as u64) * step;
+                    LyricsLine {
+                        start_ms,
+                        end_ms: start_ms + step,
+                        text: text.to_string(),
+                        words: Vec::new(),
+                    }
+                })
+                .collect();
+            LyricsDocument {
+                format: LyricsFormat::Lrc,
+                source: LyricsSource::Manual,
+                has_word_sync: false,
+                offset_ms: 0,
+                lines,
+            }
+        }
+    };
+
+    state
+        .db
+        .save_lyrics(&track_id, &doc)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("lyrics-updated", &track_id);
+    Ok(doc)
 }
 
 #[tauri::command]

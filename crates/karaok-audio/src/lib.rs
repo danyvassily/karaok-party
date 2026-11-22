@@ -13,6 +13,7 @@ pub mod atomics;
 pub mod decoder;
 pub mod engine;
 pub mod error;
+pub mod input;
 pub mod recorder;
 pub mod stretcher;
 
@@ -20,5 +21,6 @@ pub use atomics::AtomicEngineState;
 pub use decoder::{decode_audio_to_48khz_stereo, DecodedAudio};
 pub use engine::{AudioEngine, MicAudioProducer, MASTER_SAMPLE_RATE};
 pub use error::{AudioError, AudioResult};
+pub use input::{list_audio_input_devices, NativeMicInputManager};
 pub use recorder::{mix_and_export_recording, RecordingHandle};
 pub use stretcher::PitchTempoProcessor;

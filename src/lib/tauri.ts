@@ -1,11 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  ActiveMicInputs,
+  AudioInputDeviceInfo,
   DemucsModel,
   LoopRegion,
   LyricsDocument,
   MicChannelId,
-  MicPairingInfo,
   PlaybackTelemetry,
   PlaylistTrackCandidate,
   QueueItem,
@@ -188,8 +189,20 @@ export const karaokApi = {
   getTelemetry: () =>
     isTauriRuntime() ? invoke<PlaybackTelemetry>("get_telemetry") : Promise.resolve(DEFAULT_TELEMETRY),
 
-  getMicPairingInfo: () =>
-    isTauriRuntime() ? invoke<MicPairingInfo | null>("get_mic_pairing_info") : Promise.resolve(null),
+  listAudioInputDevices: () =>
+    isTauriRuntime()
+      ? invoke<AudioInputDeviceInfo[]>("list_audio_input_devices")
+      : Promise.resolve([]),
+
+  selectMicInputDevice: (channel: MicChannelId, deviceName: string | null) =>
+    isTauriRuntime()
+      ? invoke<ActiveMicInputs>("select_mic_input_device", { channel, deviceName })
+      : Promise.resolve({ mic1Device: null, mic2Device: null }),
+
+  getActiveMicInputs: () =>
+    isTauriRuntime()
+      ? invoke<ActiveMicInputs>("get_active_mic_inputs")
+      : Promise.resolve({ mic1Device: null, mic2Device: null }),
 
   setMicPreset: (channel: MicChannelId, preset: VocalPreset) =>
     isTauriRuntime()
@@ -209,6 +222,9 @@ export const karaokApi = {
 
   saveLyrics: (trackId: string, doc: LyricsDocument) =>
     invoke<LyricsDocument>("save_lyrics", { trackId, doc }),
+
+  savePlainLyricsForTrack: (trackId: string, plainLyrics: string) =>
+    invoke<LyricsDocument>("save_plain_lyrics_for_track", { trackId, plainLyrics }),
 
   fetchLrclibLyrics: (trackId: string, title: string, artist: string, durationSecs?: number) =>
     invoke<LyricsDocument>("fetch_lrclib_lyrics", {

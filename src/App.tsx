@@ -16,11 +16,12 @@ import {
   karaokApi,
 } from "./lib/tauri";
 import type {
+  ActiveMicInputs,
+  AudioInputDeviceInfo,
   DemucsModel,
   LoopRegion,
   LyricsDocument,
   MicChannelId,
-  MicPairingInfo,
   PlaybackTelemetry,
   PlaylistTrackCandidate,
   QueueItem,
@@ -44,7 +45,12 @@ export default function App() {
   const [activeTrack, setActiveTrack] = useState<Track | null>(null);
   const [lyrics, setLyrics] = useState<LyricsDocument | null>(null);
   const [telemetry, setTelemetry] = useState<PlaybackTelemetry>(DEFAULT_TELEMETRY);
-  const [pairingInfo, setPairingInfo] = useState<MicPairingInfo | null>(null);
+  const [inputDevices, setInputDevices] = useState<AudioInputDeviceInfo[]>([]);
+  const [activeMicInputs, setActiveMicInputs] = useState<ActiveMicInputs>({
+    mic1Device: null,
+    mic2Device: null,
+  });
+  const [micError, setMicError] = useState<string | null>(null);
   const [mic1Params, setMic1Params] = useState<VocalDspParams>(() => defaultVocalParams("studio"));
   const [mic2Params, setMic2Params] = useState<VocalDspParams>(() => defaultVocalParams("studio"));
 
@@ -69,11 +75,20 @@ export default function App() {
     setLyrics(doc);
   }, []);
 
+  const refreshInputDevices = useCallback(async () => {
+    const [devices, active] = await Promise.all([
+      karaokApi.listAudioInputDevices(),
+      karaokApi.getActiveMicInputs(),
+    ]);
+    setInputDevices(devices);
+    setActiveMicInputs(active);
+  }, []);
+
   // Bootstrap state & subscribe to 60Hz Tauri telemetry + backend events
   useEffect(() => {
     void refreshLibrary();
     void refreshQueue();
-    void karaokApi.getMicPairingInfo().then(setPairingInfo);
+    void refreshInputDevices();
     void karaokApi.getMicParams("mic1").then(setMic1Params);
     void karaokApi.getMicParams("mic2").then(setMic2Params);
 
@@ -117,7 +132,7 @@ export default function App() {
     return () => {
       unlisteners.forEach((fn) => fn());
     };
-  }, [refreshLibrary, refreshQueue, loadLyricsForTrack]);
+  }, [refreshLibrary, refreshQueue, refreshInputDevices, loadLyricsForTrack]);
 
   // Native macOS Drag & Drop audio file import via Tauri v2 webview
   useEffect(() => {
@@ -201,6 +216,7 @@ export default function App() {
   // Stabilized callbacks so React.memo(LeftSidebar) skips 60 Hz telemetry re-renders
   const handlePlayTrack = useCallback(async (trackId: string) => {
     try {
+      setSyncMode(false);
       const tr = await karaokApi.loadAndPlayTrack(trackId, true);
       setActiveTrack(tr);
       await loadLyricsForTrack(tr.id);
@@ -316,6 +332,24 @@ export default function App() {
       const entry = await karaokApi.stopRecording();
       setReviewRecording(entry);
     }
+  };
+
+  const handleSelectMicInput = async (ch: MicChannelId, deviceName: string | null) => {
+    setMicError(null);
+    try {
+      const updated = await karaokApi.selectMicInputDevice(ch, deviceName);
+      setActiveMicInputs(updated);
+    } catch (err) {
+      setMicError(String(err));
+    }
+  };
+
+  const handleSavePlainLyrics = async (plainText: string) => {
+    if (!activeTrack) return;
+    const saved = await karaokApi.savePlainLyricsForTrack(activeTrack.id, plainText);
+    setLyrics(saved);
+    await refreshLibrary();
+    setSyncMode(false);
   };
 
   const handleSelectMicPreset = async (ch: MicChannelId, preset: VocalPreset) => {
@@ -479,7 +513,9 @@ export default function App() {
                 if (!activeTrack) return;
                 const doc = await karaokApi.autoAlignLyricsWhisper(activeTrack.id, plain);
                 setLyrics(doc);
+                await refreshLibrary();
               }}
+              onSavePlainLyrics={handleSavePlainLyrics}
               onShiftOffset={async (delta) => {
                 if (!activeTrack) return;
                 const doc = await karaokApi.shiftLyricsOffset(activeTrack.id, delta);
@@ -489,6 +525,7 @@ export default function App() {
                 if (!activeTrack) return;
                 const saved = await karaokApi.saveLyrics(activeTrack.id, doc);
                 setLyrics(saved);
+                await refreshLibrary();
               }}
             />
           ) : (
@@ -498,28 +535,26 @@ export default function App() {
               mic1={telemetry.mic1}
               mic2={telemetry.mic2}
               showPitchGauge={showPitchGauge}
+              trackId={activeTrack?.id}
               trackTitle={activeTrack?.title}
               trackArtist={activeTrack?.artist}
               onOpenSync={() => setSyncMode(true)}
               onFetchWebLyrics={async () => {
                 if (!activeTrack) return;
-                try {
-                  const doc = await karaokApi.fetchLrclibLyrics(
-                    activeTrack.id,
-                    activeTrack.title,
-                    activeTrack.artist,
-                    Math.round(activeTrack.durationMs / 1000)
-                  );
-                  setLyrics(doc);
-                } catch {
-                  setSyncMode(true);
-                }
+                const doc = await karaokApi.fetchLrclibLyrics(
+                  activeTrack.id,
+                  activeTrack.title,
+                  activeTrack.artist,
+                  Math.round(activeTrack.durationMs / 1000)
+                );
+                setLyrics(doc);
+                await refreshLibrary();
               }}
               onSearchGoogle={async () => {
                 if (!activeTrack) return;
                 await karaokApi.openGoogleLyricsSearch(activeTrack.title, activeTrack.artist);
-                setSyncMode(true);
               }}
+              onSavePastedLyrics={handleSavePlainLyrics}
             />
           )}
         </main>
@@ -538,17 +573,24 @@ export default function App() {
         onSetStemMix={(mix: StemMix) => void karaokApi.setStemMix(mix)}
         onSetAbLoop={(region: LoopRegion) => void karaokApi.setAbLoop(region)}
         onToggleRecording={() => void handleToggleRecording()}
-        onToggleMicDrawer={() => setMicDrawerOpen((v) => !v)}
+        onToggleMicDrawer={() => {
+          setMicDrawerOpen((v) => {
+            if (!v) void refreshInputDevices();
+            return !v;
+          });
+        }}
         onToggleTvWindow={async () => {
           const opened = await karaokApi.toggleTvWindow();
           setTvOpen(opened);
         }}
       />
 
-      {/* Discreet Slide-Over Voice & iPhone Mic Drawer */}
+      {/* Discreet Slide-Over Voice & Connected Mac/iPhone Mic Drawer */}
       <VoiceMicDrawer
         open={micDrawerOpen}
-        pairingInfo={pairingInfo}
+        inputDevices={inputDevices}
+        activeMicInputs={activeMicInputs}
+        micError={micError}
         mic1Telemetry={telemetry.mic1}
         mic2Telemetry={telemetry.mic2}
         mic1Params={mic1Params}
@@ -556,6 +598,8 @@ export default function App() {
         latencyCalibrationMs={telemetry.latencyCalibrationMs}
         bufferSize={telemetry.bufferSize}
         onClose={() => setMicDrawerOpen(false)}
+        onRefreshDevices={() => void refreshInputDevices()}
+        onSelectInputDevice={(ch, name) => void handleSelectMicInput(ch, name)}
         onSelectPreset={handleSelectMicPreset}
         onUpdateParams={handleUpdateMicParams}
         onSetLatencyMs={(ms) => void karaokApi.setLatencyCalibrationMs(ms)}

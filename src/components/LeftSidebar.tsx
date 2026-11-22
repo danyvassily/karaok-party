@@ -353,11 +353,15 @@ export const LeftSidebar = memo(function LeftSidebar({
                         </button>
                       )}
 
-                      {track.hasWordSync && (
-                        <span className="text-[10px] font-medium text-sky-300/80">
-                          Mot-à-mot
+                      {track.hasWordSync ? (
+                        <span className="rounded bg-sky-400/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
+                          Paroles sync
                         </span>
-                      )}
+                      ) : track.hasLyrics ? (
+                        <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
+                          Paroles
+                        </span>
+                      ) : null}
                     </div>
                   </div>
                 );

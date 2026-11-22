@@ -11,6 +11,7 @@ interface SyncLyricsEditorProps {
   onFetchLrclib: () => Promise<void>;
   onSearchGoogle: () => Promise<void>;
   onAutoAlignWhisper: (plainLyrics: string) => Promise<void>;
+  onSavePlainLyrics: (plainLyrics: string) => Promise<void>;
   onShiftOffset: (deltaMs: number) => Promise<void>;
   onSaveLyrics: (doc: LyricsDocument) => Promise<void>;
 }
@@ -23,6 +24,7 @@ export function SyncLyricsEditor({
   onFetchLrclib,
   onSearchGoogle,
   onAutoAlignWhisper,
+  onSavePlainLyrics,
   onShiftOffset,
   onSaveLyrics,
 }: SyncLyricsEditorProps) {
@@ -112,6 +114,11 @@ export function SyncLyricsEditor({
   const handleSave = async () => {
     setBusy("save");
     try {
+      if (tapLines.length === 0 && plainText.trim()) {
+        await onSavePlainLyrics(plainText);
+        setFeedback("Paroles alignées et enregistrées dans la bibliothèque pour ce morceau.");
+        return;
+      }
       const hasWords = tapLines.some((l) => l.words.length > 0);
       const doc: LyricsDocument = {
         format: hasWords ? "enhanced_lrc" : "lrc",
@@ -121,7 +128,7 @@ export function SyncLyricsEditor({
         lines: tapLines,
       };
       await onSaveLyrics(doc);
-      setFeedback("Paroles enregistrées au format Enhanced LRC.");
+      setFeedback("Paroles enregistrées dans la bibliothèque et liées à ce morceau.");
     } catch (err) {
       setFeedback(String(err));
     } finally {
@@ -209,11 +216,11 @@ export function SyncLyricsEditor({
           <button
             type="button"
             onClick={handleSave}
-            disabled={busy !== null || tapLines.length === 0}
+            disabled={busy !== null || (tapLines.length === 0 && !plainText.trim())}
             className="flex items-center gap-1.5 rounded-xl bg-emerald-400 px-3 py-2 text-xs font-bold text-slate-950 hover:bg-emerald-300 disabled:opacity-50"
           >
             <Save className="h-3.5 w-3.5" />
-            Sauvegarder .LRC
+            Sauvegarder dans la bibliothèque
           </button>
 
           <button

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Karaok Party utilise le microphone de votre iPhone connecté au Mac (ou le micro système) pour le chant en temps réel, la réverbération et l'autotune.</string>
+</dict>
+</plist>

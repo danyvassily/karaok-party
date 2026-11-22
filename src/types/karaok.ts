@@ -139,6 +139,19 @@ export interface PlaybackTelemetry {
   mic2: MicTelemetry;
 }
 
+export interface AudioInputDeviceInfo {
+  name: string;
+  isDefault: boolean;
+  isIphone: boolean;
+  sampleRate: number;
+  channels: number;
+}
+
+export interface ActiveMicInputs {
+  mic1Device: string | null;
+  mic2Device: string | null;
+}
+
 export interface MicPairingInfo {
   serverUrl: string;
   mdnsHostname: string;
