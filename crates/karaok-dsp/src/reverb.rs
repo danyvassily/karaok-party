@@ -149,9 +149,9 @@ impl StereoReverb {
             return (dry, dry);
         }
 
-        // Fixed input scaling avoids internal comb saturation
-        let reverb_in = dry * 0.025;
-        let feedback = 0.70 + room_size.clamp(0.0, 1.0) * 0.26;
+        // Studio-calibrated input scaling for warm, clearly audible plate/hall tail
+        let reverb_in = dry * 0.055;
+        let feedback = 0.74 + room_size.clamp(0.0, 1.0) * 0.22;
         let damp1 = damping.clamp(0.0, 1.0) * 0.45;
         let damp2 = 1.0 - damp1;
 
@@ -166,14 +166,14 @@ impl StereoReverb {
             out_r = self.allpasses_r[i].process(out_r);
         }
 
-        // Subtle stereo cross-blend for natural studio width
+        // Lush stereo width blend
         let wet_l = out_l * 0.85 + out_r * 0.15;
         let wet_r = out_r * 0.85 + out_l * 0.15;
-        let dry_gain = 1.0 - wet_gain * 0.35;
+        let dry_gain = 1.0 - wet_gain * 0.25;
 
         (
-            sanitize_sample(dry * dry_gain + wet_l * wet_gain * 1.6 + tap_l * e_mix),
-            sanitize_sample(dry * dry_gain + wet_r * wet_gain * 1.6 + tap_r * e_mix),
+            sanitize_sample(dry * dry_gain + wet_l * wet_gain * 2.4 + tap_l * e_mix),
+            sanitize_sample(dry * dry_gain + wet_r * wet_gain * 2.4 + tap_r * e_mix),
         )
     }
 }

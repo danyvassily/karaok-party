@@ -216,9 +216,9 @@ impl AudioEngine {
         let music_rb = HeapRb::<f32>::new(MASTER_SAMPLE_RATE as usize * 2 / 5);
         let (music_prod, music_cons) = music_rb.split();
 
-        // Mic 1 & Mic 2 mono ring buffers: ~120 ms headroom each
-        let mic1_rb = HeapRb::<f32>::new(MASTER_SAMPLE_RATE as usize / 8);
-        let mic2_rb = HeapRb::<f32>::new(MASTER_SAMPLE_RATE as usize / 8);
+        // Mic 1 & Mic 2 mono ring buffers: ~340 ms headroom each for smooth Continuity Wi-Fi bursts
+        let mic1_rb = HeapRb::<f32>::new(16_384);
+        let mic2_rb = HeapRb::<f32>::new(16_384);
         let (mic1_prod, mic1_cons) = mic1_rb.split();
         let (mic2_prod, mic2_cons) = mic2_rb.split();
 
@@ -309,6 +309,11 @@ impl AudioEngine {
         let mut mic1_dsp = VocalDspChain::new(MASTER_SAMPLE_RATE as f32);
         let mut mic2_dsp = VocalDspChain::new(MASTER_SAMPLE_RATE as f32);
         let mut calibration_delay = CalibrationDelayLine::new();
+        // ~10.6 ms cushion (512 samples) prevents zero-stuffed crackling on iPhone Continuity bursts
+        let mut mic1_primed = false;
+        let mut mic2_primed = false;
+        let mut mic1_last = 0.0_f32;
+        let mut mic2_last = 0.0_f32;
 
         let stream = device
             .build_output_stream(
@@ -331,6 +336,26 @@ impl AudioEngine {
                         .min(250) as usize;
                     let delay_frames = (delay_ms * MASTER_SAMPLE_RATE as usize) / 1000;
 
+                    if !mic1_primed && mic1_cons.occupied_len() >= 512 {
+                        mic1_primed = true;
+                    }
+                    if !mic2_primed && mic2_cons.occupied_len() >= 512 {
+                        mic2_primed = true;
+                    }
+                    // Keep input latency tight (< 40 ms = 1920 samples) if clock drifts slightly fast
+                    if mic1_cons.occupied_len() > 2400 {
+                        let drop_n = mic1_cons.occupied_len() - 512;
+                        for _ in 0..drop_n {
+                            let _ = mic1_cons.try_pop();
+                        }
+                    }
+                    if mic2_cons.occupied_len() > 2400 {
+                        let drop_n = mic2_cons.occupied_len() - 512;
+                        for _ in 0..drop_n {
+                            let _ = mic2_cons.try_pop();
+                        }
+                    }
+
                     for frame in data.chunks_exact_mut(2) {
                         let (raw_music_l, raw_music_r) = if is_playing {
                             (
@@ -344,8 +369,33 @@ impl AudioEngine {
                         let (instru_l, instru_r) =
                             calibration_delay.process(raw_music_l, raw_music_r, delay_frames);
 
-                        let raw_m1 = mic1_cons.try_pop().unwrap_or(0.0);
-                        let raw_m2 = mic2_cons.try_pop().unwrap_or(0.0);
+                        let raw_m1 = if mic1_primed {
+                            if let Some(s) = mic1_cons.try_pop() {
+                                mic1_last = s;
+                                s
+                            } else {
+                                mic1_primed = false;
+                                mic1_last *= 0.9;
+                                mic1_last
+                            }
+                        } else {
+                            mic1_last *= 0.9;
+                            mic1_last
+                        };
+
+                        let raw_m2 = if mic2_primed {
+                            if let Some(s) = mic2_cons.try_pop() {
+                                mic2_last = s;
+                                s
+                            } else {
+                                mic2_primed = false;
+                                mic2_last *= 0.9;
+                                mic2_last
+                            }
+                        } else {
+                            mic2_last *= 0.9;
+                            mic2_last
+                        };
 
                         let (m1_l, m1_r) =
                             mic1_dsp.process_sample(raw_m1, effective_key, &mic1_params);
@@ -408,13 +458,17 @@ impl AudioEngine {
         musical_key: MusicalKey,
         favorite_transpose: i8,
     ) -> AudioResult<u64> {
-        let loaded = if let Some(dir) = stems_dir {
-            if dir.join("other.wav").exists() {
-                LoadedStemTrack::from_stems_dir(track_id.clone(), dir)?
-            } else {
-                let decoded = decode_audio_to_48khz_stereo(source_path)?;
-                LoadedStemTrack::from_single_file(track_id.clone(), decoded)
-            }
+        let _ = favorite_transpose;
+        // Only load stems if manifest matches clean v2 crossover cache (avoids old noisy v1 stems!)
+        let valid_v2_stems = stems_dir.filter(|dir| {
+            dir.join("other.wav").exists()
+                && std::fs::read_to_string(dir.join("manifest.json"))
+                    .ok()
+                    .is_some_and(|raw| raw.contains("\"cacheVersion\": 2"))
+        });
+
+        let loaded = if let Some(dir) = valid_v2_stems {
+            LoadedStemTrack::from_stems_dir(track_id.clone(), dir)?
         } else {
             let decoded = decode_audio_to_48khz_stereo(source_path)?;
             LoadedStemTrack::from_single_file(track_id.clone(), decoded)
@@ -431,9 +485,7 @@ impl AudioEngine {
             .store(duration_frames, Ordering::Relaxed);
         self.state.seek_requested_frame.store(0, Ordering::Release);
         self.state.set_song_key(musical_key);
-        self.state
-            .transpose_semitones
-            .store(favorite_transpose.clamp(-6, 6) as i32, Ordering::Relaxed);
+        self.state.transpose_semitones.store(0, Ordering::Relaxed);
 
         if let Ok(mut guard) = self.loaded_track.lock() {
             *guard = Some(Arc::new(loaded));
@@ -649,14 +701,14 @@ fn run_stem_feeder_loop(
         }
 
         let mix = state.load_stem_mix();
-        let semitones = state.transpose_semitones.load(Ordering::Relaxed).clamp(-6, 6) as f32;
+        // Transposition disabled (pure 1:1 studio playback quality without pitch-shift artifacts)
         let tempo_ratio = (state.tempo_pct() / 100.0).clamp(0.70, 1.30);
         let ab = state.load_ab_loop();
 
         let loop_start = ((ab.start_ms * MASTER_SAMPLE_RATE as u64) / 1000) as usize;
         let loop_end = ((ab.end_ms * MASTER_SAMPLE_RATE as u64) / 1000) as usize;
 
-        stretcher.set_semitones(semitones);
+        stretcher.set_semitones(0.0);
         let in_frames = ((out_block_frames as f32) * tempo_ratio).round().max(64.0) as usize;
 
         in_l.clear();

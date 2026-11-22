@@ -136,6 +136,15 @@ export function VoiceMicDrawer({
           </p>
         )}
 
+        {/* Helpful macOS privacy hint if mic is connected but receiving pure silence (-96 dB) */}
+        {((mic1Telemetry.connected && !mic1Params.muted && mic1Telemetry.vuDb <= -90) ||
+          (mic2Telemetry.connected && !mic2Params.muted && mic2Telemetry.vuDb <= -90)) && (
+          <p className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-3.5 py-2.5 text-[11px] leading-relaxed text-amber-200">
+            <strong>Aucun son micro détecté (-96 dB) :</strong> parlez près du micro ou vérifiez que l'accès au micro est autorisé dans{" "}
+            <strong>Réglages Système → Confidentialité et sécurité → Micro</strong> (et déverrouillez votre iPhone si vous utilisez Continuité).
+          </p>
+        )}
+
         {/* Direct CoreAudio Input Cards: Mic 1 (Blue) & Mic 2 (Coral) */}
         <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <MicInputCard
@@ -211,17 +220,36 @@ export function VoiceMicDrawer({
           <div className="flex items-center justify-between">
             <span className="flex items-center gap-1.5 text-xs font-bold text-slate-100">
               <Sliders className="h-3.5 w-3.5 text-sky-400" />
-              {isExpert ? "Chaîne DSP complète (Mode Expert)" : "Ajustements rapides"}
+              {isExpert ? "Chaîne DSP complète (Mode Expert)" : "Autotune & Réverbération"}
             </span>
-            <label className="flex items-center gap-1.5 text-[11px] text-slate-300">
-              <input
-                type="checkbox"
-                checked={activeParams.autotuneEnabled}
-                onChange={(e) => patchParam("autotuneEnabled", e.target.checked)}
-                className="accent-sky-400"
-              />
-              Autotune
-            </label>
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-1.5 text-[11px] font-semibold text-sky-300">
+                <input
+                  type="checkbox"
+                  checked={activeParams.autotuneEnabled}
+                  onChange={(e) =>
+                    onUpdateParams(activeMic, {
+                      ...activeParams,
+                      autotuneEnabled: e.target.checked,
+                      autotuneMix: e.target.checked ? Math.max(activeParams.autotuneMix, 1.0) : 0.0,
+                    })
+                  }
+                  className="accent-sky-400"
+                />
+                Autotune
+              </label>
+              <label className="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-300">
+                <input
+                  type="checkbox"
+                  checked={activeParams.reverbWet > 0.01}
+                  onChange={(e) =>
+                    patchParam("reverbWet", e.target.checked ? 0.36 : 0.0)
+                  }
+                  className="accent-emerald-400"
+                />
+                Réverbe
+              </label>
+            </div>
           </div>
 
           <ParamSlider

@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use karaok_audio::{decode_audio_to_48khz_stereo, DecodedAudio, MASTER_SAMPLE_RATE};
 use karaok_core::{DemucsModel, StemStatus};
-use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::info;
+
+/// Cache format version (bumped to 2 for zero-artifact time-domain Mid-Side crossover stems).
+pub const STEMS_CACHE_VERSION: u32 = 2;
 
 /// HTDemucs v4 native processing window length (7.8 seconds).
 pub const CHUNK_DURATION_SECS: f32 = 7.8;
@@ -41,6 +42,8 @@ pub enum DemucsError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DemucsManifest {
+    #[serde(default)]
+    pub cache_version: u32,
     pub content_hash: String,
     pub model: DemucsModel,
     pub sample_rate: u32,
@@ -83,16 +86,14 @@ pub trait StemSeparatorBackend: Send + Sync {
     ) -> SeparatedChunk;
 }
 
-/// Pure-Rust STFT Spectral Mid-Side + Frequency/Harmonic-Percussive Stem Separator.
+/// Clean zero-artifact time-domain Mid-Side + Smooth IIR Crossover Stem Separator.
 ///
-/// Works 100% offline with zero external model download required:
-/// - **Vocals**: center-panned (`Mid - Side` correlation mask) in human vocal band (180 Hz – 5.2 kHz)
-/// - **Bass**: low-frequency energy (< 180 Hz)
-/// - **Drums**: transient / percussive spectral flux bursts across wideband spectrum
-/// - **Other / Guitar / Piano**: stereo accompaniment residual (and band-split harmonic beds for 6s)
-///
-/// When `--features burn-metal` or `--features ort-coreml` is enabled and HTDemucs weights are
-/// downloaded, the neural backend replaces this spectral pass transparently behind the same trait.
+/// Guarantees **exact lossless sum** (`vocals + drums + bass + other == original stereo audio`)
+/// with ZERO FFT metallic/bubbling musical noise:
+/// - **Bass**: smooth low-pass (< 170 Hz)
+/// - **Vocals**: center-panned Mid (`(L+R)/2`) inside the vocal band (170 Hz – 5 200 Hz)
+/// - **Drums**: clean high-frequency shimmer/transients (> 5 200 Hz) on Mid
+/// - **Other**: full stereo Side accompaniment (`(L-R)/2`, `(R-L)/2`) preserving stereo width cleanly
 pub struct SpectralDemucsBackend;
 
 impl StemSeparatorBackend for SpectralDemucsBackend {
@@ -107,7 +108,7 @@ impl StemSeparatorBackend for SpectralDemucsBackend {
         }
         #[cfg(all(not(feature = "burn-metal"), not(feature = "ort-coreml")))]
         {
-            "spectral-local-rust"
+            "mid-side-crossover-rust"
         }
     }
 
@@ -118,169 +119,85 @@ impl StemSeparatorBackend for SpectralDemucsBackend {
         model: DemucsModel,
     ) -> SeparatedChunk {
         let len = left.len().min(right.len());
-        let fft_size = 2048usize;
-        let hop = fft_size / 4; // 75% overlap-add Hann window
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(fft_size);
-        let ifft = planner.plan_fft_inverse(fft_size);
+        let sr = MASTER_SAMPLE_RATE as f32;
 
-        let window: Vec<f32> = (0..fft_size)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / fft_size as f32).cos())
-            })
-            .collect();
+        // Smooth 1-pole exponential low-pass coefficients (zero ringing, zero FFT artifacts)
+        let alpha_bass = 1.0 - (-2.0 * std::f32::consts::PI * 170.0 / sr).exp();
+        let alpha_high = 1.0 - (-2.0 * std::f32::consts::PI * 5200.0 / sr).exp();
 
-        let mut voc_l = vec![0.0_f32; len];
-        let mut voc_r = vec![0.0_f32; len];
-        let mut drm_l = vec![0.0_f32; len];
-        let mut drm_r = vec![0.0_f32; len];
-        let mut bas_l = vec![0.0_f32; len];
-        let mut bas_r = vec![0.0_f32; len];
-        let mut oth_l = vec![0.0_f32; len];
-        let mut oth_r = vec![0.0_f32; len];
+        let mut voc_l = Vec::with_capacity(len);
+        let mut voc_r = Vec::with_capacity(len);
+        let mut drm_l = Vec::with_capacity(len);
+        let mut drm_r = Vec::with_capacity(len);
+        let mut bas_l = Vec::with_capacity(len);
+        let mut bas_r = Vec::with_capacity(len);
+        let mut oth_l = Vec::with_capacity(len);
+        let mut oth_r = Vec::with_capacity(len);
         let mut gtr_l = if model == DemucsModel::Htdemucs6s {
-            vec![0.0_f32; len]
+            Vec::with_capacity(len)
         } else {
             Vec::new()
         };
         let mut gtr_r = if model == DemucsModel::Htdemucs6s {
-            vec![0.0_f32; len]
+            Vec::with_capacity(len)
         } else {
             Vec::new()
         };
         let mut pno_l = if model == DemucsModel::Htdemucs6s {
-            vec![0.0_f32; len]
+            Vec::with_capacity(len)
         } else {
             Vec::new()
         };
         let mut pno_r = if model == DemucsModel::Htdemucs6s {
-            vec![0.0_f32; len]
+            Vec::with_capacity(len)
         } else {
             Vec::new()
         };
 
-        let mut prev_mag = vec![0.0_f32; fft_size];
-        let mut buf_l = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut buf_r = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut st_voc_l = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut st_voc_r = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut st_drm_l = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut st_drm_r = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut st_bas_l = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut st_bas_r = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut st_oth_l = vec![Complex::new(0.0_f32, 0.0); fft_size];
-        let mut st_oth_r = vec![Complex::new(0.0_f32, 0.0); fft_size];
+        let mut lp_bass_l = 0.0_f32;
+        let mut lp_bass_r = 0.0_f32;
+        let mut lp_mid_high = 0.0_f32;
 
-        let freq_per_bin = MASTER_SAMPLE_RATE as f32 / fft_size as f32;
-        // Hann 75% overlap-add normalization factor (1 / (1.5 * fft_size))
-        let norm = 1.0 / (1.5 * fft_size as f32);
+        for i in 0..len {
+            let l = left[i];
+            let r = right[i];
 
-        let mut pos = 0usize;
-        while pos < len {
-            for i in 0..fft_size {
-                let idx = pos + i;
-                let w = window[i];
-                let sl = if idx < len { left[idx] * w } else { 0.0 };
-                let sr = if idx < len { right[idx] * w } else { 0.0 };
-                buf_l[i] = Complex::new(sl, 0.0);
-                buf_r[i] = Complex::new(sr, 0.0);
+            // 1. Clean stereo bass (< 170 Hz)
+            lp_bass_l += alpha_bass * (l - lp_bass_l);
+            lp_bass_r += alpha_bass * (r - lp_bass_r);
+            let hi_l = l - lp_bass_l;
+            let hi_r = r - lp_bass_r;
+
+            // 2. Mid-Side decomposition above 170 Hz
+            let mid = 0.5 * (hi_l + hi_r);
+            let side = 0.5 * (hi_l - hi_r);
+
+            // 3. Split Mid into Vocal band (170 Hz .. 5.2 kHz) and High air/percussion (> 5.2 kHz)
+            lp_mid_high += alpha_high * (mid - lp_mid_high);
+            let vocal = lp_mid_high;
+            let high_mid = mid - lp_mid_high;
+
+            // Exact reconstruction:
+            //   bass_l + vocal + high_mid + side  == lp_bass_l + mid + side == l
+            //   bass_r + vocal + high_mid - side  == lp_bass_r + mid - side == r
+            bas_l.push(lp_bass_l);
+            bas_r.push(lp_bass_r);
+            voc_l.push(vocal);
+            voc_r.push(vocal);
+            drm_l.push(high_mid);
+            drm_r.push(high_mid);
+
+            if model == DemucsModel::Htdemucs6s {
+                oth_l.push(side * 0.5);
+                oth_r.push(-side * 0.5);
+                gtr_l.push(side * 0.25);
+                gtr_r.push(-side * 0.25);
+                pno_l.push(side * 0.25);
+                pno_r.push(-side * 0.25);
+            } else {
+                oth_l.push(side);
+                oth_r.push(-side);
             }
-
-            fft.process(&mut buf_l);
-            fft.process(&mut buf_r);
-
-            for k in 0..fft_size {
-                let bin = if k <= fft_size / 2 { k } else { fft_size - k };
-                let hz = bin as f32 * freq_per_bin;
-
-                let cl = buf_l[k];
-                let cr = buf_r[k];
-                let mid = (cl + cr) * 0.5;
-                let side = (cl - cr) * 0.5;
-                let mid_mag = mid.norm();
-                let side_mag = side.norm();
-                let total_mag = mid_mag + side_mag + 1e-8;
-
-                // Soft masks summing strictly to 1.0 so original mix reconstructs cleanly!
-                // 1. Bass (< 180 Hz)
-                let bass_mask = if hz < 140.0 {
-                    0.90
-                } else if hz < 220.0 {
-                    0.90 * (1.0 - (hz - 140.0) / 80.0)
-                } else {
-                    0.0
-                };
-
-                // 2. Percussive flux (drums)
-                let flux = (total_mag - prev_mag[k]).max(0.0) / total_mag;
-                prev_mag[k] = prev_mag[k] * 0.6 + total_mag * 0.4;
-                let drum_mask = ((flux - 0.35).max(0.0) * 1.4).clamp(0.0, 0.70) * (1.0 - bass_mask);
-
-                // 3. Center-panned vocals (180 Hz .. 5200 Hz where Mid >> Side)
-                let center_ratio = (mid_mag / total_mag).clamp(0.0, 1.0);
-                let vocal_band = if (180.0..=5200.0).contains(&hz) {
-                    1.0
-                } else if (120.0..180.0).contains(&hz) {
-                    (hz - 120.0) / 60.0
-                } else if (5200.0..7500.0).contains(&hz) {
-                    1.0 - (hz - 5200.0) / 2300.0
-                } else {
-                    0.0
-                };
-                let vocal_mask = ((center_ratio - 0.52).max(0.0) * 2.1).clamp(0.0, 0.92)
-                    * vocal_band
-                    * (1.0 - bass_mask - drum_mask).max(0.0);
-
-                let other_mask = (1.0 - bass_mask - drum_mask - vocal_mask).max(0.0);
-
-                st_bas_l[k] = cl * bass_mask;
-                st_bas_r[k] = cr * bass_mask;
-                st_drm_l[k] = cl * drum_mask;
-                st_drm_r[k] = cr * drum_mask;
-                // Keep vocals centered and clean
-                st_voc_l[k] = mid * vocal_mask;
-                st_voc_r[k] = mid * vocal_mask;
-                st_oth_l[k] = cl * other_mask + side * vocal_mask;
-                st_oth_r[k] = cr * other_mask - side * vocal_mask;
-            }
-
-            ifft.process(&mut st_voc_l);
-            ifft.process(&mut st_voc_r);
-            ifft.process(&mut st_drm_l);
-            ifft.process(&mut st_drm_r);
-            ifft.process(&mut st_bas_l);
-            ifft.process(&mut st_bas_r);
-            ifft.process(&mut st_oth_l);
-            ifft.process(&mut st_oth_r);
-
-            for i in 0..fft_size {
-                let idx = pos + i;
-                if idx >= len {
-                    break;
-                }
-                let w = window[i] * norm;
-                voc_l[idx] += st_voc_l[i].re * w;
-                voc_r[idx] += st_voc_r[i].re * w;
-                drm_l[idx] += st_drm_l[i].re * w;
-                drm_r[idx] += st_drm_r[i].re * w;
-                bas_l[idx] += st_bas_l[i].re * w;
-                bas_r[idx] += st_bas_r[i].re * w;
-                let ol = st_oth_l[i].re * w;
-                let or = st_oth_r[i].re * w;
-                if model == DemucsModel::Htdemucs6s {
-                    oth_l[idx] += ol * 0.5;
-                    oth_r[idx] += or * 0.5;
-                    gtr_l[idx] += ol * 0.25;
-                    gtr_r[idx] += or * 0.25;
-                    pno_l[idx] += ol * 0.25;
-                    pno_r[idx] += or * 0.25;
-                } else {
-                    oth_l[idx] += ol;
-                    oth_r[idx] += or;
-                }
-            }
-
-            pos += hop;
         }
 
         SeparatedChunk {
@@ -342,11 +259,12 @@ where
     std::fs::create_dir_all(&stems_dir)?;
     let manifest_path = stems_dir.join("manifest.json");
 
-    // Cache hit check
+    // Cache hit check (invalidates older v1 STFT caches automatically)
     if manifest_path.exists() {
         if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
             if let Ok(existing) = serde_json::from_str::<DemucsManifest>(&raw) {
                 if existing.completed
+                    && existing.cache_version == STEMS_CACHE_VERSION
                     && existing.model == model
                     && stems_dir.join("vocals.wav").exists()
                     && stems_dir.join("other.wav").exists()
@@ -434,6 +352,7 @@ where
 
         // Persist checkpoint manifest
         let manifest = DemucsManifest {
+            cache_version: STEMS_CACHE_VERSION,
             content_hash: content_hash.to_string(),
             model,
             sample_rate: MASTER_SAMPLE_RATE,
@@ -495,6 +414,7 @@ where
     )?;
 
     let final_manifest = DemucsManifest {
+        cache_version: STEMS_CACHE_VERSION,
         content_hash: content_hash.to_string(),
         model,
         sample_rate: MASTER_SAMPLE_RATE,

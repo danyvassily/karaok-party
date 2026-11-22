@@ -12,7 +12,7 @@ import {
   Volume2,
 } from "lucide-react";
 import type { LoopRegion, PlaybackTelemetry, StemMix } from "../types/karaok";
-import { formatMusicalKey, formatTimeMs } from "../lib/lyricsEngine";
+import { formatTimeMs } from "../lib/lyricsEngine";
 
 interface StudioDockProps {
   telemetry: PlaybackTelemetry;
@@ -21,7 +21,6 @@ interface StudioDockProps {
   onPlayPause: () => void;
   onSeekMs: (ms: number) => void;
   onRewind5s: () => void;
-  onSetTranspose: (semitones: number) => void;
   onSetTempoPct: (pct: number) => void;
   onSetStemMix: (mix: StemMix) => void;
   onSetAbLoop: (region: LoopRegion) => void;
@@ -37,7 +36,6 @@ export function StudioDock({
   onPlayPause,
   onSeekMs,
   onRewind5s,
-  onSetTranspose,
   onSetTempoPct,
   onSetStemMix,
   onSetAbLoop,
@@ -198,38 +196,8 @@ export function StudioDock({
           </button>
         </div>
 
-        {/* Center: Key Transposition (-6..+6) + Tempo + Vocal Guide */}
+        {/* Center: Tempo + Vocal Guide + 4-Stem Mix */}
         <div className="flex flex-wrap items-center gap-5">
-          {/* Key Transposer */}
-          <div className="flex items-center gap-2 rounded-xl border border-white/8 bg-[#11131B] px-3 py-1.5">
-            <span className="text-[11px] font-medium text-slate-400">Tonalité</span>
-            <button
-              type="button"
-              onClick={() => onSetTranspose(Math.max(-6, telemetry.transposeSemitones - 1))}
-              className="flex h-6 w-6 items-center justify-center rounded-md bg-white/8 text-sm font-bold text-slate-100 hover:bg-white/15"
-            >
-              -
-            </button>
-            <div className="min-w-[82px] text-center">
-              <span className="font-mono text-xs font-bold text-sky-300 tabular-nums">
-                {telemetry.transposeSemitones > 0
-                  ? `+${telemetry.transposeSemitones}`
-                  : telemetry.transposeSemitones}{" "}
-                st
-              </span>
-              <span className="ml-1.5 text-[11px] font-semibold text-amber-300">
-                {formatMusicalKey(telemetry.effectiveKey)}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => onSetTranspose(Math.min(6, telemetry.transposeSemitones + 1))}
-              className="flex h-6 w-6 items-center justify-center rounded-md bg-white/8 text-sm font-bold text-slate-100 hover:bg-white/15"
-            >
-              +
-            </button>
-          </div>
-
           {/* Tempo Control (70% .. 130%) */}
           <div className="hidden items-center gap-2 xl:flex">
             <span className="text-[11px] text-slate-400">Tempo</span>

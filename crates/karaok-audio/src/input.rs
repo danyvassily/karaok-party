@@ -187,6 +187,7 @@ impl NativeMicInputManager {
                 .build_input_stream(
                     &config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        // STRICT REAL-TIME INPUT CALLBACK: zero allocations, zero syscalls, zero logging.
                         if let Ok(mut prod) = producer.try_lock() {
                             for frame in data.chunks_exact(channels) {
                                 let mut sum = 0.0_f32;

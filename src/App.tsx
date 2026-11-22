@@ -568,7 +568,6 @@ export default function App() {
         onPlayPause={() => void karaokApi.setPlaying(!telemetry.isPlaying)}
         onSeekMs={(ms) => void karaokApi.seekMs(ms)}
         onRewind5s={() => void karaokApi.rewind5s()}
-        onSetTranspose={(st) => void karaokApi.setTranspose(st, activeTrack?.id)}
         onSetTempoPct={(pct) => void karaokApi.setTempoPct(pct)}
         onSetStemMix={(mix: StemMix) => void karaokApi.setStemMix(mix)}
         onSetAbLoop={(region: LoopRegion) => void karaokApi.setAbLoop(region)}
