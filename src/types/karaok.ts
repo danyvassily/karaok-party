@@ -143,6 +143,7 @@ export interface AudioInputDeviceInfo {
   name: string;
   isDefault: boolean;
   isIphone: boolean;
+  isBluetooth?: boolean;
   sampleRate: number;
   channels: number;
 }
@@ -150,6 +151,7 @@ export interface AudioInputDeviceInfo {
 export interface AudioOutputDeviceInfo {
   name: string;
   isDefault: boolean;
+  isBluetooth?: boolean;
   sampleRate: number;
   channels: number;
 }

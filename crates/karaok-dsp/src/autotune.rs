@@ -32,8 +32,8 @@ impl AutotuneProcessor {
             buf_mask: Self::BUFFER_LEN - 1,
             write_idx: 0,
             phase: 0.0,
-            // ~22 ms crossfade grain preserves vocal smoothness without noticeable echo
-            window_samples: (0.022 * sr).clamp(256.0, 2048.0),
+            // ~12 ms crossfade grain keeps vocal pitch correction crisp with ~6 ms avg latency
+            window_samples: (0.012 * sr).clamp(192.0, 1024.0),
             current_ratio: 1.0,
             target_cents_error: 0.0,
         }

@@ -86,6 +86,15 @@ export function VoiceMicDrawer({
     onUpdateParams(activeMic, { ...activeParams, [key]: value });
   };
 
+  const selectedOutputObj = outputDevices.find(
+    (d) => d.name === activeOutputDevice || (!activeOutputDevice && d.isDefault)
+  );
+  const mic1Obj = inputDevices.find((d) => d.name === activeMicInputs.mic1Device);
+  const mic2Obj = inputDevices.find((d) => d.name === activeMicInputs.mic2Device);
+  const hasBluetoothInChain = Boolean(
+    selectedOutputObj?.isBluetooth || mic1Obj?.isBluetooth || mic2Obj?.isBluetooth
+  );
+
   return (
     <div className="fixed inset-y-0 right-0 z-40 flex w-[470px] max-w-[95vw] flex-col border-l border-white/10 bg-[#0D0F16]/98 shadow-2xl backdrop-blur-xl">
       {/* Header */}
@@ -157,6 +166,7 @@ export function VoiceMicDrawer({
             {outputDevices.map((dev) => (
               <option key={dev.name} value={dev.name}>
                 {dev.name} ({(dev.sampleRate / 1000).toFixed(1)} kHz · {dev.channels} ch)
+                {dev.isBluetooth ? " · Bluetooth (~300ms)" : ""}
                 {dev.isDefault ? " — Par défaut" : ""}
               </option>
             ))}
@@ -165,6 +175,12 @@ export function VoiceMicDrawer({
           <p className="text-[11px] leading-relaxed text-slate-400">
             Sélectionnez vos enceintes (ex. <strong>Haut-parleurs MacBook Pro</strong>, enceintes Bluetooth ou TV HDMI) pendant que votre <strong>casque micro</strong> sert uniquement d'entrée micro ci-dessous.
           </p>
+
+          {hasBluetoothInChain && (
+            <p className="rounded-xl border border-amber-400/35 bg-amber-500/10 px-3.5 py-2.5 text-[11px] leading-relaxed text-amber-200">
+              <strong>Latence matérielle Bluetooth détectée :</strong> le Bluetooth (A2DP/HFP) ajoute ~250 à 600 ms de retard matériel. Pour un retour voix instantané (&lt; 20 ms), sélectionnez une sortie filaire (<strong>Écouteurs externes</strong> ou <strong>Haut-parleurs MacBook Pro</strong>) et un micro filaire ou le <strong>Micro de l'iPhone</strong>.
+            </p>
+          )}
         </section>
 
         {/* 2. Audio Input Selectors: Mic 1 (Headset / Mac) & Mic 2 */}
@@ -502,6 +518,7 @@ function MicInputCard({
         {devices.map((dev) => (
           <option key={dev.name} value={dev.name}>
             {dev.name} ({(dev.sampleRate / 1000).toFixed(1)} kHz)
+            {dev.isBluetooth ? " · Bluetooth (latence)" : ""}
           </option>
         ))}
       </select>

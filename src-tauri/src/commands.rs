@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use karaok_ai::{
     align_plain_lyrics_to_vocals, build_google_lyrics_url, compute_file_sha256,
-    import_spotify_playlist_metadata, import_youtube_audio, separate_track_chunked, LrclibClient,
-    PlaylistTrackCandidate, WhisperAlignConfig,
+    has_neural_stems_cache, import_spotify_playlist_metadata, import_youtube_audio,
+    neural_demucs_available, separate_track_chunked, LrclibClient, PlaylistTrackCandidate,
+    WhisperAlignConfig,
 };
 use karaok_audio::{
     decode_audio_to_48khz_stereo, is_macbook_clamshell_closed,
@@ -37,6 +38,7 @@ pub struct AppState {
     pub mic_inputs: Arc<NativeMicInputManager>,
     pub lrclib: LrclibClient,
     pub checked_legacy_lyrics: Arc<Mutex<HashSet<String>>>,
+    pub separating_tracks: Arc<Mutex<HashSet<String>>>,
 }
 
 #[tauri::command]
@@ -220,6 +222,81 @@ pub async fn delete_track(track_id: String, state: State<'_, AppState>) -> Resul
         .map_err(|e| e.to_string())
 }
 
+struct SeparationLockGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    track_id: String,
+}
+
+impl Drop for SeparationLockGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.set.lock() {
+            g.remove(&self.track_id);
+        }
+    }
+}
+
+fn spawn_stem_separation_job(
+    track: Track,
+    model: DemucsModel,
+    app: AppHandle,
+    db: KaraokDatabase,
+    stems_root: PathBuf,
+    audio: Arc<AudioEngine>,
+    separating_tracks: Arc<Mutex<HashSet<String>>>,
+) {
+    let tid = track.id.clone();
+    {
+        let Ok(mut set) = separating_tracks.lock() else {
+            return;
+        };
+        if !set.insert(tid.clone()) {
+            // Already separating this track in background
+            return;
+        }
+    }
+
+    let src = PathBuf::from(&track.source_path);
+    let hash = track.content_hash.clone();
+    let set_for_guard = Arc::clone(&separating_tracks);
+
+    tokio::task::spawn_blocking(move || {
+        let _guard = SeparationLockGuard {
+            set: set_for_guard,
+            track_id: tid.clone(),
+        };
+        let rt_handle = tokio::runtime::Handle::current();
+        let res = separate_track_chunked(&tid, &src, &stems_root, &hash, model, |ev| {
+            let _ = app.emit("stem-progress", &ev);
+            let db_c = db.clone();
+            let ev_c = ev.clone();
+            rt_handle.spawn(async move {
+                let _ = db_c
+                    .update_track_stem_progress(
+                        &ev_c.track_id,
+                        ev_c.status,
+                        ev_c.progress_pct,
+                        Some(&ev_c.stems_dir),
+                    )
+                    .await;
+            });
+            if ev.status == StemStatus::StreamingReady || ev.status == StemStatus::Completed {
+                let _ = audio.hot_swap_stems(&ev.track_id, &PathBuf::from(&ev.stems_dir));
+            }
+        });
+
+        if let Err(err) = res {
+            warn!("Stem separation failed for {tid}: {err}");
+            let db_c = db.clone();
+            let tid_c = tid.clone();
+            rt_handle.spawn(async move {
+                let _ = db_c
+                    .update_track_stem_progress(&tid_c, StemStatus::Failed, 0, None)
+                    .await;
+            });
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn separate_track_stems(
     track_id: String,
@@ -240,52 +317,15 @@ pub async fn separate_track_stems(
         .await
         .map_err(|e| e.to_string())?;
 
-    let stems_root = state.stems_dir.clone();
-    let db = state.db.clone();
-    let audio = Arc::clone(&state.audio);
-    let src = PathBuf::from(track.source_path);
-    let hash = track.content_hash;
-    let tid = track_id.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let rt_handle = tokio::runtime::Handle::current();
-        let res = separate_track_chunked(
-            &tid,
-            &src,
-            &stems_root,
-            &hash,
-            selected_model,
-            |ev| {
-                let _ = app.emit("stem-progress", &ev);
-                let db_c = db.clone();
-                let ev_c = ev.clone();
-                rt_handle.spawn(async move {
-                    let _ = db_c
-                        .update_track_stem_progress(
-                            &ev_c.track_id,
-                            ev_c.status,
-                            ev_c.progress_pct,
-                            Some(&ev_c.stems_dir),
-                        )
-                        .await;
-                });
-                if ev.status == StemStatus::StreamingReady || ev.status == StemStatus::Completed {
-                    let _ = audio.hot_swap_stems(&ev.track_id, &PathBuf::from(&ev.stems_dir));
-                }
-            },
-        );
-
-        if let Err(err) = res {
-            warn!("Stem separation failed for {tid}: {err}");
-            let db_c = db.clone();
-            let tid_c = tid.clone();
-            rt_handle.spawn(async move {
-                let _ = db_c
-                    .update_track_stem_progress(&tid_c, StemStatus::Failed, 0, None)
-                    .await;
-            });
-        }
-    });
+    spawn_stem_separation_job(
+        track,
+        selected_model,
+        app,
+        state.db.clone(),
+        state.stems_dir.clone(),
+        Arc::clone(&state.audio),
+        Arc::clone(&state.separating_tracks),
+    );
 
     Ok(())
 }
@@ -301,7 +341,7 @@ pub async fn load_and_play_track(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Track, String> {
-    let track = state
+    let mut track = state
         .db
         .get_track(&track_id)
         .await
@@ -323,6 +363,31 @@ pub async fn load_and_play_track(
     if autoplay.unwrap_or(true) {
         state.audio.play();
     }
+
+    // Automatically upgrade missing / legacy v1-v2 stems to Neural Meta HTDemucs v4 when available
+    // so dragging "Voix Guide" cleanly isolates or removes the original singer!
+    let has_v3 = track
+        .stems_dir
+        .as_deref()
+        .is_some_and(|dir| has_neural_stems_cache(PathBuf::from(dir).as_path()));
+    if !has_v3 && neural_demucs_available() {
+        track.stem_status = StemStatus::Processing;
+        track.stem_progress = track.stem_progress.clamp(2, 99);
+        let _ = state
+            .db
+            .update_track_stem_progress(&track.id, StemStatus::Processing, track.stem_progress, None)
+            .await;
+        spawn_stem_separation_job(
+            track.clone(),
+            track.stem_model,
+            app.clone(),
+            state.db.clone(),
+            state.stems_dir.clone(),
+            Arc::clone(&state.audio),
+            Arc::clone(&state.separating_tracks),
+        );
+    }
+
     let _ = app.emit("active-track-changed", &track);
     Ok(track)
 }

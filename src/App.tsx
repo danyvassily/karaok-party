@@ -119,6 +119,16 @@ export default function App() {
               : tr
           )
         );
+        setActiveTrack((prev) =>
+          prev && prev.id === ev.trackId
+            ? {
+                ...prev,
+                stemStatus: ev.status,
+                stemProgress: ev.progressPct,
+                stemsDir: ev.stemsDir,
+              }
+            : prev
+        );
       })
       .then((u) => unlisteners.push(u));
     void karaokApi
@@ -619,6 +629,7 @@ export default function App() {
       {/* Bottom Studio Control Dock */}
       <StudioDock
         telemetry={telemetry}
+        activeTrack={activeTrack}
         tvOpen={tvOpen}
         micDrawerOpen={micDrawerOpen}
         onPlayPause={() => void karaokApi.setPlaying(!telemetry.isPlaying)}
@@ -626,6 +637,7 @@ export default function App() {
         onRewind5s={() => void karaokApi.rewind5s()}
         onSetTempoPct={(pct) => void karaokApi.setTempoPct(pct)}
         onSetStemMix={(mix: StemMix) => void karaokApi.setStemMix(mix)}
+        onSeparateStems={(trackId, model) => void handleSeparateStems(trackId, model)}
         onSetAbLoop={(region: LoopRegion) => void karaokApi.setAbLoop(region)}
         onToggleRecording={() => void handleToggleRecording()}
         onToggleMicDrawer={() => {

@@ -1,17 +1,21 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use hound::{SampleFormat, WavSpec, WavWriter};
+use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use karaok_audio::{decode_audio_to_48khz_stereo, DecodedAudio, MASTER_SAMPLE_RATE};
 use karaok_core::{DemucsModel, StemStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
-/// Cache format version (bumped to 2 for zero-artifact time-domain Mid-Side crossover stems).
-pub const STEMS_CACHE_VERSION: u32 = 2;
+/// Cache format version:
+/// - `2`: fallback zero-artifact time-domain Mid-Side crossover
+/// - `3`: Meta AI `HTDemucs v4` / `htdemucs_6s` neural stem separation
+pub const STEMS_CACHE_VERSION: u32 = 3;
+const FALLBACK_CACHE_VERSION: u32 = 2;
 
 /// HTDemucs v4 native processing window length (7.8 seconds).
 pub const CHUNK_DURATION_SECS: f32 = 7.8;
@@ -36,6 +40,9 @@ pub enum DemucsError {
 
     #[error("Invalid content hash for stem cache key: {0}")]
     InvalidCacheKey(String),
+
+    #[error("Neural Demucs process failed: {0}")]
+    Process(String),
 }
 
 /// Persisted cache & resume checkpoint manifest saved in `<stems_dir>/manifest.json`.
@@ -44,6 +51,8 @@ pub enum DemucsError {
 pub struct DemucsManifest {
     #[serde(default)]
     pub cache_version: u32,
+    #[serde(default)]
+    pub backend: String,
     pub content_hash: String,
     pub model: DemucsModel,
     pub sample_rate: u32,
@@ -53,7 +62,7 @@ pub struct DemucsManifest {
     pub completed: bool,
 }
 
-/// Real-time progress update emitted after each 7.8s chunk finishes.
+/// Real-time progress update emitted while separation runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StemProgressEvent {
@@ -65,7 +74,7 @@ pub struct StemProgressEvent {
     pub stems_dir: String,
 }
 
-/// Output buffers for a single 7.8s chunk.
+/// Output buffers for a single 7.8s fallback chunk.
 pub struct SeparatedChunk {
     pub vocals: (Vec<f32>, Vec<f32>),
     pub drums: (Vec<f32>, Vec<f32>),
@@ -75,7 +84,62 @@ pub struct SeparatedChunk {
     pub piano: Option<(Vec<f32>, Vec<f32>)>,
 }
 
-/// Pluggable backend interface for HTDemucs v4 (Burn Metal, ONNX CoreML, or Spectral Rust).
+/// Locates the Meta AI `demucs` CLI executable (app-managed uv venv first, then system `PATH`).
+pub fn find_demucs_binary() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("KARAOK_DEMUCS_BIN") {
+        let p = PathBuf::from(explicit);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    if let Some(data_dir) = dirs::data_dir() {
+        let p = data_dir.join("KaraokParty/demucs-venv/bin/demucs");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".local/share/karaok-party/demucs-venv/bin/demucs");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("demucs");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Returns `true` when Meta AI `demucs` neural CLI is installed and runnable.
+pub fn neural_demucs_available() -> bool {
+    find_demucs_binary().is_some()
+}
+
+/// Returns `true` when `stems_dir` contains a completed neural HTDemucs cache (`cacheVersion == 3`).
+pub fn has_neural_stems_cache(stems_dir: &Path) -> bool {
+    let manifest_path = stems_dir.join("manifest.json");
+    let Ok(raw) = std::fs::read_to_string(manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<DemucsManifest>(&raw) else {
+        return false;
+    };
+    manifest.completed
+        && manifest.cache_version >= STEMS_CACHE_VERSION
+        && stems_dir.join("vocals.wav").exists()
+        && stems_dir.join("other.wav").exists()
+}
+
+/// Pluggable backend interface for fallback offline separation.
 pub trait StemSeparatorBackend: Send + Sync {
     fn backend_name(&self) -> &'static str;
     fn separate_chunk(
@@ -86,30 +150,12 @@ pub trait StemSeparatorBackend: Send + Sync {
     ) -> SeparatedChunk;
 }
 
-/// Clean zero-artifact time-domain Mid-Side + Smooth IIR Crossover Stem Separator.
-///
-/// Guarantees **exact lossless sum** (`vocals + drums + bass + other == original stereo audio`)
-/// with ZERO FFT metallic/bubbling musical noise:
-/// - **Bass**: smooth low-pass (< 170 Hz)
-/// - **Vocals**: center-panned Mid (`(L+R)/2`) inside the vocal band (170 Hz – 5 200 Hz)
-/// - **Drums**: clean high-frequency shimmer/transients (> 5 200 Hz) on Mid
-/// - **Other**: full stereo Side accompaniment (`(L-R)/2`, `(R-L)/2`) preserving stereo width cleanly
+/// Fallback clean time-domain Mid-Side + IIR Crossover separator when neural Demucs binary is absent.
 pub struct SpectralDemucsBackend;
 
 impl StemSeparatorBackend for SpectralDemucsBackend {
     fn backend_name(&self) -> &'static str {
-        #[cfg(feature = "burn-metal")]
-        {
-            return "htdemucs-burn-metal";
-        }
-        #[cfg(all(not(feature = "burn-metal"), feature = "ort-coreml"))]
-        {
-            return "htdemucs-ort-coreml";
-        }
-        #[cfg(all(not(feature = "burn-metal"), not(feature = "ort-coreml")))]
-        {
-            "mid-side-crossover-rust"
-        }
+        "mid-side-crossover-fallback"
     }
 
     fn separate_chunk(
@@ -121,7 +167,6 @@ impl StemSeparatorBackend for SpectralDemucsBackend {
         let len = left.len().min(right.len());
         let sr = MASTER_SAMPLE_RATE as f32;
 
-        // Smooth 1-pole exponential low-pass coefficients (zero ringing, zero FFT artifacts)
         let alpha_bass = 1.0 - (-2.0 * std::f32::consts::PI * 170.0 / sr).exp();
         let alpha_high = 1.0 - (-2.0 * std::f32::consts::PI * 5200.0 / sr).exp();
 
@@ -133,26 +178,12 @@ impl StemSeparatorBackend for SpectralDemucsBackend {
         let mut bas_r = Vec::with_capacity(len);
         let mut oth_l = Vec::with_capacity(len);
         let mut oth_r = Vec::with_capacity(len);
-        let mut gtr_l = if model == DemucsModel::Htdemucs6s {
-            Vec::with_capacity(len)
-        } else {
-            Vec::new()
-        };
-        let mut gtr_r = if model == DemucsModel::Htdemucs6s {
-            Vec::with_capacity(len)
-        } else {
-            Vec::new()
-        };
-        let mut pno_l = if model == DemucsModel::Htdemucs6s {
-            Vec::with_capacity(len)
-        } else {
-            Vec::new()
-        };
-        let mut pno_r = if model == DemucsModel::Htdemucs6s {
-            Vec::with_capacity(len)
-        } else {
-            Vec::new()
-        };
+        let six_stem = model == DemucsModel::Htdemucs6s;
+        let cap6 = if six_stem { len } else { 0 };
+        let mut gtr_l = Vec::with_capacity(cap6);
+        let mut gtr_r = Vec::with_capacity(cap6);
+        let mut pno_l = Vec::with_capacity(cap6);
+        let mut pno_r = Vec::with_capacity(cap6);
 
         let mut lp_bass_l = 0.0_f32;
         let mut lp_bass_r = 0.0_f32;
@@ -162,24 +193,18 @@ impl StemSeparatorBackend for SpectralDemucsBackend {
             let l = left[i];
             let r = right[i];
 
-            // 1. Clean stereo bass (< 170 Hz)
             lp_bass_l += alpha_bass * (l - lp_bass_l);
             lp_bass_r += alpha_bass * (r - lp_bass_r);
             let hi_l = l - lp_bass_l;
             let hi_r = r - lp_bass_r;
 
-            // 2. Mid-Side decomposition above 170 Hz
             let mid = 0.5 * (hi_l + hi_r);
             let side = 0.5 * (hi_l - hi_r);
 
-            // 3. Split Mid into Vocal band (170 Hz .. 5.2 kHz) and High air/percussion (> 5.2 kHz)
             lp_mid_high += alpha_high * (mid - lp_mid_high);
             let vocal = lp_mid_high;
             let high_mid = mid - lp_mid_high;
 
-            // Exact reconstruction:
-            //   bass_l + vocal + high_mid + side  == lp_bass_l + mid + side == l
-            //   bass_r + vocal + high_mid - side  == lp_bass_r + mid - side == r
             bas_l.push(lp_bass_l);
             bas_r.push(lp_bass_r);
             voc_l.push(vocal);
@@ -187,7 +212,7 @@ impl StemSeparatorBackend for SpectralDemucsBackend {
             drm_l.push(high_mid);
             drm_r.push(high_mid);
 
-            if model == DemucsModel::Htdemucs6s {
+            if six_stem {
                 oth_l.push(side * 0.5);
                 oth_r.push(-side * 0.5);
                 gtr_l.push(side * 0.25);
@@ -205,16 +230,8 @@ impl StemSeparatorBackend for SpectralDemucsBackend {
             drums: (drm_l, drm_r),
             bass: (bas_l, bas_r),
             other: (oth_l, oth_r),
-            guitar: if model == DemucsModel::Htdemucs6s {
-                Some((gtr_l, gtr_r))
-            } else {
-                None
-            },
-            piano: if model == DemucsModel::Htdemucs6s {
-                Some((pno_l, pno_r))
-            } else {
-                None
-            },
+            guitar: if six_stem { Some((gtr_l, gtr_r)) } else { None },
+            piano: if six_stem { Some((pno_l, pno_r)) } else { None },
         }
     }
 }
@@ -234,15 +251,37 @@ pub fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Separates an audio file into 4 or 6 stems using **7.8-second chunked streaming windows**,
-/// emitting `StemStatus::StreamingReady` as soon as the first 25 seconds are flushed to disk,
-/// and persisting resume checkpoints in `<stems_cache_root>/<content_hash>/manifest.json`.
+/// Runs neural Meta AI `HTDemucs` when installed (`cacheVersion: 3`), or falls back cleanly
+/// to the zero-artifact Mid-Side crossover separator (`cacheVersion: 2`).
 pub fn separate_track_chunked<F>(
     track_id: &str,
     source_path: &Path,
     stems_cache_root: &Path,
     content_hash: &str,
     model: DemucsModel,
+    on_progress: F,
+) -> Result<PathBuf, DemucsError>
+where
+    F: FnMut(StemProgressEvent),
+{
+    separate_track_with_mode(
+        track_id,
+        source_path,
+        stems_cache_root,
+        content_hash,
+        model,
+        true,
+        on_progress,
+    )
+}
+
+fn separate_track_with_mode<F>(
+    track_id: &str,
+    source_path: &Path,
+    stems_cache_root: &Path,
+    content_hash: &str,
+    model: DemucsModel,
+    allow_neural: bool,
     mut on_progress: F,
 ) -> Result<PathBuf, DemucsError>
 where
@@ -255,16 +294,28 @@ where
     {
         return Err(DemucsError::InvalidCacheKey(content_hash.to_string()));
     }
+
     let stems_dir = stems_cache_root.join(content_hash);
     std::fs::create_dir_all(&stems_dir)?;
     let manifest_path = stems_dir.join("manifest.json");
 
-    // Cache hit check (invalidates older v1 STFT caches automatically)
+    let neural_bin = if allow_neural {
+        find_demucs_binary()
+    } else {
+        None
+    };
+    let required_version = if neural_bin.is_some() {
+        STEMS_CACHE_VERSION
+    } else {
+        FALLBACK_CACHE_VERSION
+    };
+
+    // Cache hit check (automatically upgrades legacy v1/v2 stems when neural HTDemucs is present!)
     if manifest_path.exists() {
         if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
             if let Ok(existing) = serde_json::from_str::<DemucsManifest>(&raw) {
                 if existing.completed
-                    && existing.cache_version == STEMS_CACHE_VERSION
+                    && existing.cache_version >= required_version
                     && existing.model == model
                     && stems_dir.join("vocals.wav").exists()
                     && stems_dir.join("other.wav").exists()
@@ -273,8 +324,8 @@ where
                         track_id: track_id.to_string(),
                         status: StemStatus::Completed,
                         progress_pct: 100,
-                        completed_chunks: existing.total_chunks,
-                        total_chunks: existing.total_chunks,
+                        completed_chunks: existing.total_chunks.max(1),
+                        total_chunks: existing.total_chunks.max(1),
                         stems_dir: stems_dir.to_string_lossy().into_owned(),
                     });
                     return Ok(stems_dir);
@@ -283,6 +334,246 @@ where
         }
     }
 
+    // 1. Primary Studio Path: Real Meta AI HTDemucs neural source separation (GPU MPS on Apple Silicon)
+    if let Some(bin) = neural_bin {
+        match run_neural_demucs(
+            &bin,
+            track_id,
+            source_path,
+            &stems_dir,
+            content_hash,
+            model,
+            &mut on_progress,
+        ) {
+            Ok(()) => return Ok(stems_dir),
+            Err(err) => {
+                warn!("Neural HTDemucs failed, falling back to Mid-Side separator: {err}");
+            }
+        }
+    }
+
+    // 2. Fallback Path (offline / no Python neural runtime)
+    run_fallback_chunked(
+        track_id,
+        source_path,
+        &stems_dir,
+        content_hash,
+        model,
+        &mut on_progress,
+    )?;
+    Ok(stems_dir)
+}
+
+fn run_neural_demucs<F>(
+    demucs_bin: &Path,
+    track_id: &str,
+    source_path: &Path,
+    stems_dir: &Path,
+    content_hash: &str,
+    model: DemucsModel,
+    on_progress: &mut F,
+) -> Result<(), DemucsError>
+where
+    F: FnMut(StemProgressEvent),
+{
+    let model_name = match model {
+        DemucsModel::Htdemucs => "htdemucs",
+        DemucsModel::Htdemucs6s => "htdemucs_6s",
+    };
+
+    let tmp_out = stems_dir.join(".tmp_neural");
+    let _ = std::fs::remove_dir_all(&tmp_out);
+    std::fs::create_dir_all(&tmp_out)?;
+
+    on_progress(StemProgressEvent {
+        track_id: track_id.to_string(),
+        status: StemStatus::Processing,
+        progress_pct: 3,
+        completed_chunks: 0,
+        total_chunks: 100,
+        stems_dir: stems_dir.to_string_lossy().into_owned(),
+    });
+
+    let devices: &[&str] = if cfg!(target_os = "macos") {
+        &["mps", "cpu"]
+    } else {
+        &["cpu"]
+    };
+
+    let mut succeeded = false;
+    let mut last_err = String::new();
+
+    for &dev in devices {
+        let _ = std::fs::remove_dir_all(&tmp_out);
+        std::fs::create_dir_all(&tmp_out)?;
+
+        info!(
+            "Running neural Demucs ({model_name} on device={dev}) for track {track_id}"
+        );
+
+        let mut child = Command::new(demucs_bin)
+            .args(["-n", model_name, "-d", dev, "--float32", "-o"])
+            .arg(&tmp_out)
+            .arg(source_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        if let Some(mut stderr) = child.stderr.take() {
+            let mut buf = [0u8; 256];
+            let mut line_acc = String::new();
+            let mut last_pct: u8 = 3;
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&buf[..n]);
+                for ch in text.chars() {
+                    if ch == '\r' || ch == '\n' {
+                        if let Some(pct) = parse_tqdm_pct(&line_acc) {
+                            let scaled = pct.clamp(3, 96);
+                            if scaled > last_pct {
+                                last_pct = scaled;
+                                on_progress(StemProgressEvent {
+                                    track_id: track_id.to_string(),
+                                    status: StemStatus::Processing,
+                                    progress_pct: scaled,
+                                    completed_chunks: scaled as usize,
+                                    total_chunks: 100,
+                                    stems_dir: stems_dir.to_string_lossy().into_owned(),
+                                });
+                            }
+                        }
+                        line_acc.clear();
+                    } else if line_acc.len() < 200 {
+                        line_acc.push(ch);
+                    }
+                }
+            }
+        }
+
+        let status = child.wait()?;
+        if status.success() {
+            succeeded = true;
+            break;
+        }
+        last_err = format!("demucs exited with status {status} on device {dev}");
+        warn!("{last_err}");
+    }
+
+    if !succeeded {
+        let _ = std::fs::remove_dir_all(&tmp_out);
+        return Err(DemucsError::Process(last_err));
+    }
+
+    // Locate `<tmp_out>/<model_name>/<track_stem>/` containing vocals.wav & other.wav
+    let model_dir = tmp_out.join(model_name);
+    let mut stem_subdir: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&model_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p.join("vocals.wav").exists() && p.join("other.wav").exists() {
+                stem_subdir = Some(p);
+                break;
+            }
+        }
+    }
+
+    let Some(src_dir) = stem_subdir else {
+        let _ = std::fs::remove_dir_all(&tmp_out);
+        return Err(DemucsError::Process(
+            "Demucs output stems directory was not created".into(),
+        ));
+    };
+
+    let stem_files: &[&str] = if model == DemucsModel::Htdemucs6s {
+        &["vocals.wav", "drums.wav", "bass.wav", "other.wav", "guitar.wav", "piano.wav"]
+    } else {
+        &["vocals.wav", "drums.wav", "bass.wav", "other.wav"]
+    };
+
+    for fname in stem_files {
+        let src = src_dir.join(fname);
+        if src.exists() {
+            let dst = stems_dir.join(fname);
+            let tmp_dst = stems_dir.join(format!("{fname}.tmp"));
+            if std::fs::rename(&src, &tmp_dst).is_err() {
+                std::fs::copy(&src, &tmp_dst)?;
+            }
+            std::fs::rename(&tmp_dst, &dst)?;
+        }
+    }
+
+    let (sample_rate, total_frames) = WavReader::open(stems_dir.join("vocals.wav"))
+        .map(|r| {
+            let spec = r.spec();
+            let ch = spec.channels.max(1) as usize;
+            (spec.sample_rate, r.len() as usize / ch)
+        })
+        .unwrap_or((44_100, 0));
+
+    let _ = std::fs::remove_dir_all(&tmp_out);
+
+    let final_manifest = DemucsManifest {
+        cache_version: STEMS_CACHE_VERSION,
+        backend: model_name.to_string(),
+        content_hash: content_hash.to_string(),
+        model,
+        sample_rate,
+        total_frames,
+        total_chunks: 100,
+        completed_chunks: 100,
+        completed: true,
+    };
+    std::fs::write(
+        stems_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&final_manifest)?,
+    )?;
+
+    on_progress(StemProgressEvent {
+        track_id: track_id.to_string(),
+        status: StemStatus::Completed,
+        progress_pct: 100,
+        completed_chunks: 100,
+        total_chunks: 100,
+        stems_dir: stems_dir.to_string_lossy().into_owned(),
+    });
+
+    info!(
+        "Neural HTDemucs separation complete for track {track_id} -> {}",
+        stems_dir.display()
+    );
+    Ok(())
+}
+
+fn parse_tqdm_pct(line: &str) -> Option<u8> {
+    let idx = line.find('%')?;
+    let prefix = line[..idx].trim();
+    let digits: String = prefix
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u8>().ok()
+}
+
+fn run_fallback_chunked<F>(
+    track_id: &str,
+    source_path: &Path,
+    stems_dir: &Path,
+    content_hash: &str,
+    model: DemucsModel,
+    on_progress: &mut F,
+) -> Result<(), DemucsError>
+where
+    F: FnMut(StemProgressEvent),
+{
     let decoded: DecodedAudio = decode_audio_to_48khz_stereo(source_path)?;
     let total_frames = decoded.frames();
     let chunk_frames = (CHUNK_DURATION_SECS * MASTER_SAMPLE_RATE as f32) as usize;
@@ -314,6 +605,7 @@ where
         None
     };
 
+    let manifest_path = stems_dir.join("manifest.json");
     let mut fast_start_emitted = false;
 
     for chunk_idx in 0..total_chunks {
@@ -350,9 +642,9 @@ where
         let completed = chunk_idx + 1;
         let progress_pct = ((completed * 100) / total_chunks).min(99) as u8;
 
-        // Persist checkpoint manifest
         let manifest = DemucsManifest {
-            cache_version: STEMS_CACHE_VERSION,
+            cache_version: FALLBACK_CACHE_VERSION,
+            backend: backend.backend_name().to_string(),
             content_hash: content_hash.to_string(),
             model,
             sample_rate: MASTER_SAMPLE_RATE,
@@ -363,12 +655,12 @@ where
         };
         let _ = std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
 
-        // Fast-start flush: as soon as >= 25s are separated (or track is shorter), flush playable WAVs
-        let reached_fast_start = !fast_start_emitted && (end >= fast_start_frames || completed == total_chunks);
+        let reached_fast_start =
+            !fast_start_emitted && (end >= fast_start_frames || completed == total_chunks);
         if reached_fast_start && completed < total_chunks {
             fast_start_emitted = true;
             flush_stems_to_disk(
-                &stems_dir,
+                stems_dir,
                 &out_voc,
                 &out_drm,
                 &out_bas,
@@ -401,9 +693,8 @@ where
         }
     }
 
-    // Final complete write
     flush_stems_to_disk(
-        &stems_dir,
+        stems_dir,
         &out_voc,
         &out_drm,
         &out_bas,
@@ -414,7 +705,8 @@ where
     )?;
 
     let final_manifest = DemucsManifest {
-        cache_version: STEMS_CACHE_VERSION,
+        cache_version: FALLBACK_CACHE_VERSION,
+        backend: backend.backend_name().to_string(),
         content_hash: content_hash.to_string(),
         model,
         sample_rate: MASTER_SAMPLE_RATE,
@@ -434,7 +726,7 @@ where
         stems_dir: stems_dir.to_string_lossy().into_owned(),
     });
 
-    Ok(stems_dir)
+    Ok(())
 }
 
 fn blend_chunk(
@@ -508,12 +800,18 @@ mod tests {
     use std::f32::consts::TAU;
 
     #[test]
+    fn parses_demucs_tqdm_progress_percentages() {
+        assert_eq!(parse_tqdm_pct("  37%|██████   | 87.75/239.85"), Some(37));
+        assert_eq!(parse_tqdm_pct("100%|██████| 239.85/239.85"), Some(100));
+        assert_eq!(parse_tqdm_pct("Loading weights..."), None);
+    }
+
+    #[test]
     fn spectral_demucs_separates_and_writes_4_stems_with_manifest() {
         let tmp = std::env::temp_dir().join(format!("karaok-demucs-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // Create a 2-second test WAV with centered 440 Hz vocal + 80 Hz bass + stereo pad
         let src_wav = tmp.join("input.wav");
         let sr = MASTER_SAMPLE_RATE as f32;
         let frames = MASTER_SAMPLE_RATE as usize * 2;
@@ -530,12 +828,13 @@ mod tests {
         write_stereo_wav(&src_wav, &l, &r).unwrap();
 
         let mut events = Vec::new();
-        let out_dir = separate_track_chunked(
+        let out_dir = separate_track_with_mode(
             "trk-test",
             &src_wav,
             &tmp.join("cache"),
             "testhash001",
             DemucsModel::Htdemucs,
+            false,
             |ev| events.push(ev),
         )
         .unwrap();
@@ -547,17 +846,71 @@ mod tests {
         assert!(out_dir.join("manifest.json").exists());
         assert_eq!(events.last().unwrap().status, StemStatus::Completed);
 
-        // Path traversal guard check
-        let bad = separate_track_chunked(
+        let bad = separate_track_with_mode(
             "trk-bad",
             &src_wav,
             &tmp.join("cache"),
             "../evil",
             DemucsModel::Htdemucs,
+            false,
             |_| {},
         );
         assert!(matches!(bad, Err(DemucsError::InvalidCacheKey(_))));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[ignore = "Requires installed neural HTDemucs venv + local Stay audio track"]
+    fn upgrade_stay_track_with_neural_htdemucs_and_verify_attenuation() {
+        assert!(
+            neural_demucs_available(),
+            "Neural HTDemucs binary must be installed in KaraokParty/demucs-venv"
+        );
+        let data_dir = dirs::data_local_dir()
+            .unwrap()
+            .join("KaraokParty");
+        let src_wav = data_dir.join("downloads").join("_bXqoIzH0N8.wav");
+        if !src_wav.exists() {
+            panic!("Missing test fixture audio: {}", src_wav.display());
+        }
+        let stems_root = data_dir.join("stems");
+        let hash = "464bbd56d73bb327890475c51c8a562da57191e0fc9f8364aad2512488dc15f4";
+
+        let mut events = Vec::new();
+        let out_dir = separate_track_chunked(
+            "ef931612-e295-487e-ab08-4dac256cdc2e",
+            &src_wav,
+            &stems_root,
+            hash,
+            DemucsModel::Htdemucs,
+            |ev| events.push(ev),
+        )
+        .expect("Neural HTDemucs separation on Stay");
+
+        assert!(has_neural_stems_cache(&out_dir), "Expected cacheVersion: 3 manifest");
+        assert_eq!(events.last().unwrap().status, StemStatus::Completed);
+
+        let voc = karaok_audio::decode_audio_to_48khz_stereo(&out_dir.join("vocals.wav")).unwrap();
+        let oth = karaok_audio::decode_audio_to_48khz_stereo(&out_dir.join("other.wav")).unwrap();
+
+        let rms = |buf: &[f32], s0: usize, s1: usize| -> f32 {
+            let slice = &buf[s0.min(buf.len())..s1.min(buf.len())];
+            (slice.iter().map(|x| x * x).sum::<f32>() / slice.len().max(1) as f32).sqrt()
+        };
+
+        // 2s..10s = piano-only intro, 18s..35s = Rihanna lead vocal verse
+        let intro_voc = rms(&voc.left, 48_000 * 2, 48_000 * 10);
+        let verse_voc = rms(&voc.left, 48_000 * 18, 48_000 * 35);
+        let verse_oth = rms(&oth.left, 48_000 * 18, 48_000 * 35);
+        eprintln!(
+            "Stay Neural Stems RMS -> intro_voc={intro_voc:.4}, verse_voc={verse_voc:.4}, verse_other={verse_oth:.4}"
+        );
+        assert!(intro_voc < 0.025, "Expected silent vocals during piano intro, got {intro_voc}");
+        assert!(
+            verse_voc > intro_voc * 4.0 && verse_voc > 0.05,
+            "Expected isolated singing vocals in verse, got verse={verse_voc}, intro={intro_voc}"
+        );
+        assert!(verse_oth > 0.03, "Expected piano accompaniment preserved in other.wav, got {verse_oth}");
     }
 }

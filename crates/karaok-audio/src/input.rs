@@ -21,6 +21,7 @@ mod macos_av {
         pub channels: u16,
         pub is_default: bool,
         pub is_iphone: bool,
+        pub is_bluetooth: bool,
     }
 
     pub type KpAvAudioCallback = extern "C" fn(
@@ -45,6 +46,7 @@ mod macos_av {
             err_buf_len: usize,
         ) -> *mut c_void;
         pub fn kp_av_stop_capture(handle: *mut c_void);
+        pub fn kp_ca_device_transport_kind(name: *const c_char, is_output: bool) -> u32;
     }
 
     pub fn cstr_to_string(buf: &[c_char]) -> String {
@@ -56,6 +58,39 @@ mod macos_av {
 
     pub fn make_cstring(s: &str) -> Result<CString, String> {
         CString::new(s).map_err(|_| "Nom de périphérique audio invalide".to_string())
+    }
+}
+
+/// Returns `true` if the CoreAudio device uses Bluetooth / Bluetooth LE transport.
+pub fn coreaudio_device_is_bluetooth(name: &str, is_output: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(c_name) = macos_av::make_cstring(name) else {
+            return false;
+        };
+        unsafe { macos_av::kp_ca_device_transport_kind(c_name.as_ptr(), is_output) == 3 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (name, is_output);
+        false
+    }
+}
+
+/// Returns `true` if the CoreAudio device is Built-In or USB hardware suited to 128-frame buffers.
+pub fn coreaudio_prefers_low_latency(name: &str, is_output: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(c_name) = macos_av::make_cstring(name) else {
+            return false;
+        };
+        let kind = unsafe { macos_av::kp_ca_device_transport_kind(c_name.as_ptr(), is_output) };
+        kind == 1 || kind == 2
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (name, is_output);
+        false
     }
 }
 
@@ -107,6 +142,7 @@ pub fn list_audio_input_devices() -> Vec<AudioInputDeviceInfo> {
             channels: 1,
             is_default: false,
             is_iphone: false,
+            is_bluetooth: false,
         }; 32];
 
         let raw_count =
@@ -123,12 +159,14 @@ pub fn list_audio_input_devices() -> Vec<AudioInputDeviceInfo> {
                 existing.channels = existing.channels.max(item.channels.max(1));
                 existing.is_default |= item.is_default;
                 existing.is_iphone |= item.is_iphone;
+                existing.is_bluetooth |= item.is_bluetooth;
                 continue;
             }
             out.push(AudioInputDeviceInfo {
                 name,
                 is_default: item.is_default,
                 is_iphone: item.is_iphone,
+                is_bluetooth: item.is_bluetooth,
                 sample_rate: item.sample_rate.max(8000),
                 channels: item.channels.max(1),
             });
@@ -158,6 +196,7 @@ pub fn list_audio_input_devices() -> Vec<AudioInputDeviceInfo> {
                     name,
                     is_default: false,
                     is_iphone: false,
+                    is_bluetooth: false,
                     sample_rate: cfg.sample_rate(),
                     channels: cfg.channels(),
                 })

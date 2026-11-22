@@ -11,11 +11,18 @@ import {
   Tv,
   Volume2,
 } from "lucide-react";
-import type { LoopRegion, PlaybackTelemetry, StemMix } from "../types/karaok";
+import type {
+  DemucsModel,
+  LoopRegion,
+  PlaybackTelemetry,
+  StemMix,
+  Track,
+} from "../types/karaok";
 import { formatTimeMs } from "../lib/lyricsEngine";
 
 interface StudioDockProps {
   telemetry: PlaybackTelemetry;
+  activeTrack: Track | null;
   tvOpen: boolean;
   micDrawerOpen: boolean;
   onPlayPause: () => void;
@@ -23,6 +30,7 @@ interface StudioDockProps {
   onRewind5s: () => void;
   onSetTempoPct: (pct: number) => void;
   onSetStemMix: (mix: StemMix) => void;
+  onSeparateStems: (trackId: string, model: DemucsModel) => void;
   onSetAbLoop: (region: LoopRegion) => void;
   onToggleRecording: () => void;
   onToggleMicDrawer: () => void;
@@ -31,6 +39,7 @@ interface StudioDockProps {
 
 export function StudioDock({
   telemetry,
+  activeTrack,
   tvOpen,
   micDrawerOpen,
   onPlayPause,
@@ -38,12 +47,16 @@ export function StudioDock({
   onRewind5s,
   onSetTempoPct,
   onSetStemMix,
+  onSeparateStems,
   onSetAbLoop,
   onToggleRecording,
   onToggleMicDrawer,
   onToggleTvWindow,
 }: StudioDockProps) {
   const [stemMixerOpen, setStemMixerOpen] = useState(false);
+  const stemsReady =
+    activeTrack?.stemStatus === "completed" || activeTrack?.stemStatus === "streaming_ready";
+  const stemsProcessing = activeTrack?.stemStatus === "processing";
 
   const progressPct =
     telemetry.durationMs > 0
@@ -79,26 +92,46 @@ export function StudioDock({
     <footer className="relative z-20 border-t border-white/8 bg-[#0D0F16]/95 px-5 py-3 backdrop-blur-xl">
       {/* 4-Stem Mixer Popover */}
       {stemMixerOpen && (
-        <div className="absolute bottom-full right-56 mb-3 w-72 rounded-2xl border border-white/12 bg-[#141722] p-4 shadow-2xl">
-          <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-xs font-bold text-slate-100">Mixeur 4 Pistes (Demucs)</h3>
-            <button
-              type="button"
-              onClick={() =>
-                onSetStemMix({
-                  vocals: 0.0,
-                  drums: 1.0,
-                  bass: 1.0,
-                  other: 1.0,
-                  guitar: 1.0,
-                  piano: 1.0,
-                })
-              }
-              className="text-[11px] font-medium text-sky-400 hover:underline"
-            >
-              Instrumental pur
-            </button>
+        <div className="absolute bottom-full right-56 mb-3 w-76 rounded-2xl border border-white/12 bg-[#141722] p-4 shadow-2xl">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <h3 className="text-xs font-bold text-slate-100">Mixeur 4 Pistes (Demucs IA)</h3>
+            {activeTrack && !stemsReady && !stemsProcessing ? (
+              <button
+                type="button"
+                onClick={() => onSeparateStems(activeTrack.id, "htdemucs")}
+                className="rounded-md bg-sky-400/20 px-2 py-0.5 text-[11px] font-semibold text-sky-300 hover:bg-sky-400/30"
+              >
+                Séparer IA
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() =>
+                  onSetStemMix({
+                    vocals: 0.0,
+                    drums: 1.0,
+                    bass: 1.0,
+                    other: 1.0,
+                    guitar: 1.0,
+                    piano: 1.0,
+                  })
+                }
+                className="text-[11px] font-medium text-sky-400 hover:underline"
+              >
+                Instrumental pur
+              </button>
+            )}
           </div>
+          {activeTrack && stemsProcessing && (
+            <p className="mb-2.5 rounded-lg border border-sky-400/25 bg-sky-500/10 px-2.5 py-1.5 text-[11px] text-sky-200">
+              Séparation IA Demucs en cours ({Math.round(activeTrack.stemProgress)}%) — la voix guide deviendra indépendante automatiquement.
+            </p>
+          )}
+          {activeTrack && !stemsReady && !stemsProcessing && (
+            <p className="mb-2.5 rounded-lg border border-amber-400/25 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-200">
+              Pistes IA non encore générées : cliquez « Séparer IA » pour isoler Voix Guide.
+            </p>
+          )}
           <div className="space-y-2.5">
             {(
               [
@@ -218,6 +251,21 @@ export function StudioDock({
           <div className="flex items-center gap-2 rounded-xl border border-white/8 bg-[#11131B] px-3 py-1.5">
             <Volume2 className="h-3.5 w-3.5 text-sky-400" />
             <span className="text-[11px] text-slate-400">Voix Guide</span>
+            {activeTrack && stemsProcessing && (
+              <span className="rounded bg-sky-500/20 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-sky-300 tabular-nums">
+                IA {Math.round(activeTrack.stemProgress)}%
+              </span>
+            )}
+            {activeTrack && !stemsReady && !stemsProcessing && (
+              <button
+                type="button"
+                onClick={() => onSeparateStems(activeTrack.id, "htdemucs")}
+                title="Lancer la séparation IA HTDemucs pour isoler la voix"
+                className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300 hover:bg-amber-500/30"
+              >
+                Séparer IA
+              </button>
+            )}
             <input
               type="range"
               min={0}

@@ -10,8 +10,9 @@ pub mod whisper_align;
 pub mod youtube;
 
 pub use demucs::{
-    compute_file_sha256, separate_track_chunked, DemucsManifest, StemProgressEvent,
-    CHUNK_DURATION_SECS, FAST_START_SECS,
+    compute_file_sha256, find_demucs_binary, has_neural_stems_cache, neural_demucs_available,
+    separate_track_chunked, DemucsManifest, StemProgressEvent, CHUNK_DURATION_SECS,
+    FAST_START_SECS, STEMS_CACHE_VERSION,
 };
 pub use lrclib::{build_google_lyrics_url, clean_search_metadata, LrclibClient, LrclibRecord};
 pub use whisper_align::{

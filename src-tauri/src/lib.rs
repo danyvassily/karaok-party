@@ -78,6 +78,7 @@ pub fn run() {
                 mic_inputs: Arc::clone(&mic_inputs),
                 lrclib: LrclibClient::new(),
                 checked_legacy_lyrics: Arc::new(Mutex::new(HashSet::new())),
+                separating_tracks: Arc::new(Mutex::new(HashSet::new())),
             });
 
             // Initialize TCC permission + auto-connect a non-clamshell mic OFF the AppKit main

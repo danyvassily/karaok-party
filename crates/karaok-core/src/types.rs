@@ -392,6 +392,8 @@ pub struct AudioInputDeviceInfo {
     pub name: String,
     pub is_default: bool,
     pub is_iphone: bool,
+    #[serde(default)]
+    pub is_bluetooth: bool,
     pub sample_rate: u32,
     pub channels: u16,
 }
@@ -402,6 +404,8 @@ pub struct AudioInputDeviceInfo {
 pub struct AudioOutputDeviceInfo {
     pub name: String,
     pub is_default: bool,
+    #[serde(default)]
+    pub is_bluetooth: bool,
     pub sample_rate: u32,
     pub channels: u16,
 }

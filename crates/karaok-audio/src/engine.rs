@@ -188,6 +188,17 @@ fn cpal_device_name(dev: &cpal::Device) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+fn cpal_is_bluetooth(dev: &cpal::Device) -> bool {
+    if cpal_device_name(dev)
+        .is_some_and(|name| crate::input::coreaudio_device_is_bluetooth(&name, true))
+    {
+        return true;
+    }
+    dev.description()
+        .ok()
+        .is_some_and(|d| d.interface_type() == cpal::InterfaceType::Bluetooth)
+}
+
 fn resolve_output_config(dev: &cpal::Device) -> Option<cpal::SupportedStreamConfig> {
     if let Ok(cfg) = dev.default_output_config() {
         if cfg.sample_rate() > 0 && cfg.channels() > 0 {
@@ -255,18 +266,21 @@ pub fn list_audio_output_devices() -> Vec<AudioOutputDeviceInfo> {
             continue;
         }
         let is_default = default_name.as_deref() == Some(name.as_str());
+        let is_bluetooth = cpal_is_bluetooth(&dev);
         if let Some(existing) = out.iter_mut().find(|d| d.name == name) {
             // Keep the richer stereo / higher sample-rate endpoint if CoreAudio exposes two with the same name
             if ch > existing.channels || sr > existing.sample_rate || is_default {
                 existing.channels = existing.channels.max(ch);
                 existing.sample_rate = existing.sample_rate.max(sr);
                 existing.is_default |= is_default;
+                existing.is_bluetooth |= is_bluetooth;
             }
             continue;
         }
         out.push(AudioOutputDeviceInfo {
             name,
             is_default,
+            is_bluetooth,
             sample_rate: sr,
             channels: ch,
         });
@@ -435,8 +449,28 @@ impl AudioEngine {
                 "Configuration CoreAudio indisponible pour « {resolved_name} »"
             ))
         })?;
+        let is_bluetooth = cpal_is_bluetooth(&device);
+        let prefers_low_latency_buffer = !is_bluetooth
+            && (crate::input::coreaudio_prefers_low_latency(&resolved_name, true)
+                || device
+                    .description()
+                    .map(|d| {
+                        matches!(
+                            d.interface_type(),
+                            cpal::InterfaceType::BuiltIn | cpal::InterfaceType::Usb
+                        )
+                    })
+                    .unwrap_or(false));
         let sample_format = default_cfg.sample_format();
-        let config: StreamConfig = default_cfg.into();
+        let supported_bs = *default_cfg.buffer_size();
+        let mut config: StreamConfig = default_cfg.into();
+        if prefers_low_latency_buffer {
+            if let cpal::SupportedBufferSize::Range { min, max } = supported_bs {
+                if (min..=max).contains(&128) {
+                    config.buffer_size = cpal::BufferSize::Fixed(128);
+                }
+            }
+        }
         let out_rate = config.sample_rate.max(8000);
         let out_channels = config.channels.max(1) as usize;
 
@@ -515,11 +549,11 @@ impl AudioEngine {
             }
 
             if mic1_connected {
-                if !mic1_primed && c.mic1_cons.occupied_len() >= 512 {
+                if !mic1_primed && c.mic1_cons.occupied_len() >= 256 {
                     mic1_primed = true;
                 }
-                if c.mic1_cons.occupied_len() > 3600 {
-                    let drop_n = c.mic1_cons.occupied_len() - 960;
+                if c.mic1_cons.occupied_len() > 1280 {
+                    let drop_n = c.mic1_cons.occupied_len() - 256;
                     for _ in 0..drop_n {
                         let _ = c.mic1_cons.try_pop();
                     }
@@ -530,11 +564,11 @@ impl AudioEngine {
             }
 
             if mic2_connected {
-                if !mic2_primed && c.mic2_cons.occupied_len() >= 512 {
+                if !mic2_primed && c.mic2_cons.occupied_len() >= 256 {
                     mic2_primed = true;
                 }
-                if c.mic2_cons.occupied_len() > 3600 {
-                    let drop_n = c.mic2_cons.occupied_len() - 960;
+                if c.mic2_cons.occupied_len() > 1280 {
+                    let drop_n = c.mic2_cons.occupied_len() - 256;
                     for _ in 0..drop_n {
                         let _ = c.mic2_cons.try_pop();
                     }
@@ -797,15 +831,17 @@ impl AudioEngine {
         favorite_transpose: i8,
     ) -> AudioResult<u64> {
         let _ = favorite_transpose;
-        // Only load stems if manifest matches clean v2 crossover cache (avoids old noisy v1 stems!)
-        let valid_v2_stems = stems_dir.filter(|dir| {
+        // Accept neural v3 (HTDemucs) or clean v2 crossover stems (skips legacy v1 STFT caches!)
+        let valid_stems = stems_dir.filter(|dir| {
             dir.join("other.wav").exists()
                 && std::fs::read_to_string(dir.join("manifest.json"))
                     .ok()
-                    .is_some_and(|raw| raw.contains("\"cacheVersion\": 2"))
+                    .is_some_and(|raw| {
+                        raw.contains("\"cacheVersion\": 3") || raw.contains("\"cacheVersion\": 2")
+                    })
         });
 
-        let loaded = if let Some(dir) = valid_v2_stems {
+        let loaded = if let Some(dir) = valid_stems {
             LoadedStemTrack::from_stems_dir(track_id.clone(), dir)?
         } else {
             let decoded = decode_audio_to_48khz_stereo(source_path)?;
@@ -1204,5 +1240,61 @@ mod tests {
         assert!(stereo_diff > 0.002, "Expected active stereo reverb width on voice return");
 
         let _ = std::fs::remove_dir_all(&rec_dir);
+    }
+
+    #[test]
+    #[ignore = "Requires Stay neural stems cacheVersion 3"]
+    fn stay_vocals_slider_attenuates_singing_in_audio_engine() {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME set"));
+        let data_dir = home.join("Library/Application Support/KaraokParty");
+        let stems_dir = data_dir.join(
+            "stems/464bbd56d73bb327890475c51c8a562da57191e0fc9f8364aad2512488dc15f4",
+        );
+        assert!(
+            stems_dir.join("vocals.wav").exists(),
+            "Run upgrade_stay_track_with_neural_htdemucs_and_verify_attenuation first"
+        );
+        let (engine, _mics) = AudioEngine::new();
+        let src_wav = data_dir.join("downloads/_bXqoIzH0N8.wav");
+        let dur = engine
+            .load_track(
+                "stay-test".to_string(),
+                &src_wav,
+                Some(&stems_dir),
+                karaok_core::MusicalKey::default(),
+                0,
+            )
+            .expect("load stay stems");
+        assert!(dur > 200_000);
+        // Verify full vocals vs muted vocals mix RMS directly via StemMix
+        let vocals = crate::decode_audio_to_48khz_stereo(&stems_dir.join("vocals.wav")).unwrap();
+        let other = crate::decode_audio_to_48khz_stereo(&stems_dir.join("other.wav")).unwrap();
+        let s0 = 48_000 * 18;
+        let s1 = 48_000 * 35;
+        let full_energy: f32 = (s0..s1)
+            .map(|i| {
+                let s = vocals.left[i] + other.left[i];
+                s * s
+            })
+            .sum::<f32>()
+            / (s1 - s0) as f32;
+        let inst_energy: f32 = (s0..s1)
+            .map(|i| {
+                let s = other.left[i];
+                s * s
+            })
+            .sum::<f32>()
+            / (s1 - s0) as f32;
+        eprintln!(
+            "Stay Verse Mix RMS: vocals+other={:.4}, vocals_muted(0%)={:.4} (ratio={:.2}x energy)",
+            full_energy.sqrt(),
+            inst_energy.sqrt(),
+            full_energy / inst_energy.max(1e-9)
+        );
+        assert!(
+            full_energy > inst_energy * 1.4,
+            "Lowering Voix Guide -> 0% must substantially drop vocal energy during verse (got ratio {:.2})",
+            full_energy / inst_energy.max(1e-9)
+        );
     }
 }

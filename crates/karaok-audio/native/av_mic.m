@@ -17,6 +17,7 @@ typedef struct {
     uint16_t channels;
     bool is_default;
     bool is_iphone;
+    bool is_bluetooth;
 } KpAvDeviceInfo;
 
 typedef void (*KpAvAudioCallback)(
@@ -147,6 +148,10 @@ size_t kp_av_list_input_devices(KpAvDeviceInfo *out_buf, size_t max_count) {
                 [lowerModel containsString:@"iphone"];
             bool is_default =
                 defaultUid != nil && [dev.uniqueID isEqualToString:defaultUid];
+            int32_t transport = dev.transportType;
+            bool is_bluetooth =
+                transport == (int32_t)kAudioDeviceTransportTypeBluetooth ||
+                transport == (int32_t)kAudioDeviceTransportTypeBluetoothLE;
 
             KpAvDeviceInfo info;
             memset(&info, 0, sizeof(info));
@@ -155,9 +160,103 @@ size_t kp_av_list_input_devices(KpAvDeviceInfo *out_buf, size_t max_count) {
             info.channels = channels;
             info.is_default = is_default;
             info.is_iphone = is_iphone;
+            info.is_bluetooth = is_bluetooth;
             out_buf[written++] = info;
         }
         return written;
+    }
+}
+
+uint32_t kp_ca_device_transport_kind(const char *name, bool is_output) {
+    if (!name || name[0] == '\0') {
+        return 0;
+    }
+    @autoreleasepool {
+        NSString *targetName = [NSString stringWithUTF8String:name];
+        if (!targetName) {
+            return 0;
+        }
+        AudioObjectPropertyAddress propAddr = {
+            kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 dataSize = 0;
+        if (AudioObjectGetPropertyDataSize(
+                kAudioObjectSystemObject, &propAddr, 0, NULL, &dataSize) != noErr ||
+            dataSize == 0) {
+            return 0;
+        }
+        size_t count = dataSize / sizeof(AudioDeviceID);
+        AudioDeviceID *devIds = (AudioDeviceID *)malloc(dataSize);
+        if (!devIds) {
+            return 0;
+        }
+        uint32_t kind = 0;
+        if (AudioObjectGetPropertyData(
+                kAudioObjectSystemObject, &propAddr, 0, NULL, &dataSize, devIds) == noErr) {
+            AudioObjectPropertyScope scope =
+                is_output ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput;
+            for (size_t i = 0; i < count; i++) {
+                AudioDeviceID devId = devIds[i];
+
+                AudioObjectPropertyAddress streamAddr = {
+                    kAudioDevicePropertyStreams,
+                    scope,
+                    kAudioObjectPropertyElementMain
+                };
+                UInt32 streamSize = 0;
+                if (AudioObjectGetPropertyDataSize(
+                        devId, &streamAddr, 0, NULL, &streamSize) != noErr ||
+                    streamSize == 0) {
+                    continue;
+                }
+
+                CFStringRef cfName = NULL;
+                UInt32 nameSize = sizeof(cfName);
+                AudioObjectPropertyAddress nameAddr = {
+                    kAudioDevicePropertyDeviceNameCFString,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain
+                };
+                if (AudioObjectGetPropertyData(
+                        devId, &nameAddr, 0, NULL, &nameSize, &cfName) != noErr ||
+                    !cfName) {
+                    continue;
+                }
+                bool matches = [(__bridge NSString *)cfName isEqualToString:targetName];
+                CFRelease(cfName);
+                if (!matches) {
+                    continue;
+                }
+
+                UInt32 transport = 0;
+                UInt32 transportSize = sizeof(transport);
+                AudioObjectPropertyAddress transAddr = {
+                    kAudioDevicePropertyTransportType,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain
+                };
+                if (AudioObjectGetPropertyData(
+                        devId, &transAddr, 0, NULL, &transportSize, &transport) == noErr) {
+                    if (transport == kAudioDeviceTransportTypeBluetooth ||
+                        transport == kAudioDeviceTransportTypeBluetoothLE) {
+                        kind = 3;
+                    } else if (transport == kAudioDeviceTransportTypeBuiltIn) {
+                        kind = 1;
+                    } else if (transport == kAudioDeviceTransportTypeUSB) {
+                        kind = 2;
+                    } else if (transport == kAudioDeviceTransportTypeHDMI ||
+                               transport == kAudioDeviceTransportTypeDisplayPort ||
+                               transport == kAudioDeviceTransportTypeAirPlay) {
+                        kind = 4;
+                    }
+                    break;
+                }
+            }
+        }
+        free(devIds);
+        return kind;
     }
 }
 
