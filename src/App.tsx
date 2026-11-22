@@ -348,6 +348,7 @@ export default function App() {
     try {
       const routing = await karaokApi.selectAudioOutputDevice(deviceName);
       setActiveOutputDevice(routing.outputDevice);
+      await refreshAudioDevices();
     } catch (err) {
       setMicError(String(err));
     }
@@ -358,6 +359,7 @@ export default function App() {
     try {
       const updated = await karaokApi.selectMicInputDevice(ch, deviceName);
       setActiveMicInputs(updated);
+      await refreshAudioDevices();
     } catch (err) {
       setMicError(String(err));
     }

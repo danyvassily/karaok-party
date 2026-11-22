@@ -181,32 +181,94 @@ impl CalibrationDelayLine {
     }
 }
 
+fn cpal_device_name(dev: &cpal::Device) -> Option<String> {
+    dev.description()
+        .ok()
+        .map(|d| d.name().to_string())
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn resolve_output_config(dev: &cpal::Device) -> Option<cpal::SupportedStreamConfig> {
+    if let Ok(cfg) = dev.default_output_config() {
+        if cfg.sample_rate() > 0 && cfg.channels() > 0 {
+            return Some(cfg);
+        }
+    }
+    let ranges = dev.supported_output_configs().ok()?;
+    let mut best: Option<cpal::SupportedStreamConfig> = None;
+    for r in ranges {
+        if r.channels() == 0 {
+            continue;
+        }
+        let target_sr = if r.min_sample_rate() <= MASTER_SAMPLE_RATE
+            && r.max_sample_rate() >= MASTER_SAMPLE_RATE
+        {
+            MASTER_SAMPLE_RATE
+        } else if r.min_sample_rate() <= 44_100 && r.max_sample_rate() >= 44_100 {
+            44_100
+        } else {
+            r.max_sample_rate()
+        };
+        if target_sr == 0 {
+            continue;
+        }
+        let cand = r.with_sample_rate(target_sr);
+        let better = match &best {
+            None => true,
+            Some(prev) => {
+                (cand.channels() >= 2 && prev.channels() < 2)
+                    || (cand.sample_format() == SampleFormat::F32
+                        && prev.sample_format() != SampleFormat::F32)
+                    || cand.sample_rate() > prev.sample_rate()
+            }
+        };
+        if better {
+            best = Some(cand);
+        }
+    }
+    best
+}
+
 /// Lists all usable CoreAudio output devices visible to macOS (MacBook speakers, Bluetooth
 /// speakers like HECATE/RS-620, HDMI TVs, wired headphones, etc.).
 pub fn list_audio_output_devices() -> Vec<AudioOutputDeviceInfo> {
     let host = cpal::default_host();
-    let default_name = host.default_output_device().and_then(|d| d.name().ok());
+    let default_name = host
+        .default_output_device()
+        .and_then(|d| cpal_device_name(&d));
 
     let Ok(devices) = host.output_devices() else {
         return Vec::new();
     };
 
-    let mut out = Vec::new();
+    let mut out: Vec<AudioOutputDeviceInfo> = Vec::new();
     for dev in devices {
-        let Ok(name) = dev.name() else { continue };
-        let Ok(cfg) = dev.default_output_config() else {
+        let Some(name) = cpal_device_name(&dev) else {
             continue;
         };
-        let sr = cfg.sample_rate().0;
-        if sr == 0 || cfg.channels() == 0 {
+        let Some(cfg) = resolve_output_config(&dev) else {
+            continue;
+        };
+        let sr = cfg.sample_rate();
+        let ch = cfg.channels();
+        if sr == 0 || ch == 0 {
             continue;
         }
         let is_default = default_name.as_deref() == Some(name.as_str());
+        if let Some(existing) = out.iter_mut().find(|d| d.name == name) {
+            // Keep the richer stereo / higher sample-rate endpoint if CoreAudio exposes two with the same name
+            if ch > existing.channels || sr > existing.sample_rate || is_default {
+                existing.channels = existing.channels.max(ch);
+                existing.sample_rate = existing.sample_rate.max(sr);
+                existing.is_default |= is_default;
+            }
+            continue;
+        }
         out.push(AudioOutputDeviceInfo {
             name,
             is_default,
             sample_rate: sr,
-            channels: cfg.channels(),
+            channels: ch,
         });
     }
 
@@ -351,21 +413,13 @@ impl AudioEngine {
     /// Automatically matches the target speaker's native sample rate (44.1 kHz, 48 kHz, etc.)
     /// and channel count using zero-allocation linear resampling from our 48 kHz internal bus.
     pub fn select_output_device(&self, device_name: Option<&str>) -> AudioResult<()> {
-        // 1. Stop & drop the previous stream cleanly on the control thread so `RtOutputBundle`
-        // returns its lock-free SPSC handles back into `self.output_consumers`.
-        {
-            let mut stream_guard = self
-                .output_stream
-                .lock()
-                .map_err(|_| AudioError::Device("Output stream lock poisoned".into()))?;
-            *stream_guard = None;
-        }
-
+        // 1. Resolve target device & configuration BEFORE stopping the currently playing stream
+        // so an unavailable/disconnected device never interrupts playback.
         let host = cpal::default_host();
         let device = if let Some(target) = device_name.filter(|s| !s.trim().is_empty()) {
             host.output_devices()
                 .map_err(|e| AudioError::Device(e.to_string()))?
-                .find(|d| d.name().ok().as_deref() == Some(target))
+                .find(|d| cpal_device_name(d).as_deref() == Some(target))
                 .ok_or_else(|| {
                     AudioError::Device(format!("Sortie audio introuvable : « {target} »"))
                 })?
@@ -374,14 +428,27 @@ impl AudioEngine {
                 .ok_or_else(|| AudioError::Device("Aucune sortie audio CoreAudio détectée".into()))?
         };
 
-        let resolved_name = device.name().unwrap_or_else(|_| "Sortie par défaut".into());
-        let default_cfg = device
-            .default_output_config()
-            .map_err(|e| AudioError::Device(e.to_string()))?;
+        let resolved_name =
+            cpal_device_name(&device).unwrap_or_else(|| "Sortie par défaut".into());
+        let default_cfg = resolve_output_config(&device).ok_or_else(|| {
+            AudioError::Device(format!(
+                "Configuration CoreAudio indisponible pour « {resolved_name} »"
+            ))
+        })?;
         let sample_format = default_cfg.sample_format();
         let config: StreamConfig = default_cfg.into();
-        let out_rate = config.sample_rate.0.max(8000);
+        let out_rate = config.sample_rate.max(8000);
         let out_channels = config.channels.max(1) as usize;
+
+        // 2. Stop & drop the previous stream cleanly on the control thread so `RtOutputBundle`
+        // returns its lock-free SPSC handles back into `self.output_consumers`.
+        {
+            let mut stream_guard = self
+                .output_stream
+                .lock()
+                .map_err(|_| AudioError::Device("Output stream lock poisoned".into()))?;
+            *stream_guard = None;
+        }
 
         let consumers = self
             .output_consumers
@@ -570,44 +637,14 @@ impl AudioEngine {
         let mut scratch_r = [0.0_f32; 4096];
 
         let err_dev = resolved_name.clone();
-        let err_fn = move |err: cpal::StreamError| {
+        let err_fn = move |err: cpal::Error| {
             warn!("CoreAudio output error on '{err_dev}': {err}");
         };
 
         let stream = match sample_format {
-            SampleFormat::F32 => device
-                .build_output_stream(
-                    &config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        let total_frames = data.len() / out_channels;
-                        let mut offset = 0usize;
-                        while offset < total_frames {
-                            let n = (total_frames - offset).min(scratch_l.len());
-                            render_block(&mut scratch_l[..n], &mut scratch_r[..n]);
-                            for i in 0..n {
-                                let base = (offset + i) * out_channels;
-                                let l = scratch_l[i];
-                                let r = scratch_r[i];
-                                if out_channels == 1 {
-                                    data[base] = 0.5 * (l + r);
-                                } else {
-                                    data[base] = l;
-                                    data[base + 1] = r;
-                                    for ch in 2..out_channels {
-                                        data[base + ch] = 0.0;
-                                    }
-                                }
-                            }
-                            offset += n;
-                        }
-                    },
-                    err_fn,
-                    None,
-                )
-                .map_err(|e| AudioError::Device(e.to_string()))?,
             SampleFormat::I16 => device
                 .build_output_stream(
-                    &config,
+                    config,
                     move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                         let total_frames = data.len() / out_channels;
                         let mut offset = 0usize;
@@ -639,7 +676,7 @@ impl AudioEngine {
                 .map_err(|e| AudioError::Device(e.to_string()))?,
             SampleFormat::U16 => device
                 .build_output_stream(
-                    &config,
+                    config,
                     move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
                         let total_frames = data.len() / out_channels;
                         let mut offset = 0usize;
@@ -670,11 +707,37 @@ impl AudioEngine {
                     None,
                 )
                 .map_err(|e| AudioError::Device(e.to_string()))?,
-            other => {
-                return Err(AudioError::Device(format!(
-                    "Format de sortie CoreAudio non supporté : {other:?}"
-                )));
-            }
+            // CoreAudio AUHAL natively accepts F32 for F32 / I24 / I32 / F64 hardware endpoints
+            _ => device
+                .build_output_stream(
+                    config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        let total_frames = data.len() / out_channels;
+                        let mut offset = 0usize;
+                        while offset < total_frames {
+                            let n = (total_frames - offset).min(scratch_l.len());
+                            render_block(&mut scratch_l[..n], &mut scratch_r[..n]);
+                            for i in 0..n {
+                                let base = (offset + i) * out_channels;
+                                let l = scratch_l[i];
+                                let r = scratch_r[i];
+                                if out_channels == 1 {
+                                    data[base] = 0.5 * (l + r);
+                                } else {
+                                    data[base] = l;
+                                    data[base + 1] = r;
+                                    for ch in 2..out_channels {
+                                        data[base + ch] = 0.0;
+                                    }
+                                }
+                            }
+                            offset += n;
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| AudioError::Device(e.to_string()))?,
         };
 
         stream
@@ -1023,5 +1086,36 @@ mod tests {
         let t = engine.telemetry();
         assert_eq!(t.transpose_semitones, -2);
         assert_eq!(t.effective_key.root, karaok_core::PitchClass::F);
+    }
+
+    #[test]
+    fn output_hot_switch_preserves_consumers_and_switches_speakers() {
+        let outputs = list_audio_output_devices();
+        let Some(alt_speaker) = outputs
+            .iter()
+            .find(|d| !d.is_default && d.channels >= 2 && d.sample_rate >= 44_100)
+        else {
+            return;
+        };
+
+        let (engine, _mics) = AudioEngine::new();
+        engine
+            .select_output_device(None)
+            .expect("start on default output");
+        assert!(engine.active_output_device().is_some());
+
+        // Switching to a nonexistent output must fail WITHOUT losing the running stream or consumers
+        assert!(engine
+            .select_output_device(Some("__NonExistent_Karaok_Device__"))
+            .is_err());
+
+        // Switching to a real non-default speaker (e.g. Haut-parleurs MacBook Pro / HECATE G1000 II)
+        engine
+            .select_output_device(Some(&alt_speaker.name))
+            .expect("hot-switch to non-default speaker");
+        assert_eq!(
+            engine.active_output_device().as_deref(),
+            Some(alt_speaker.name.as_str())
+        );
     }
 }
