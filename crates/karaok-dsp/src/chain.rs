@@ -206,4 +206,26 @@ mod tests {
             assert!(snap.vu_db > -30.0, "VU too low for {preset:?}: {}", snap.vu_db);
         }
     }
+
+    #[test]
+    fn vocal_chain_renders_one_second_much_faster_than_realtime() {
+        let sr = 48_000.0;
+        let mut chain = VocalDspChain::new(sr);
+        let key = MusicalKey::new(PitchClass::C, ScaleType::Chromatic);
+        let params = VocalDspParams::from_preset(VocalPreset::Studio);
+
+        let start = std::time::Instant::now();
+        let mut acc = 0.0_f32;
+        for i in 0..48_000 {
+            let input = 0.35 * (TAU * 330.0 * (i as f32) / sr).sin();
+            let (l, r) = chain.process_sample(input, key, &params);
+            acc += l + r;
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(acc.is_finite());
+        assert!(
+            elapsed_ms < 50.0,
+            "1s of vocal DSP took {elapsed_ms:.2} ms (must stay far below real-time 1000 ms)"
+        );
+    }
 }

@@ -52,15 +52,17 @@ pub fn run() {
             let audio = Arc::new(audio_engine);
             let mic_inputs = Arc::new(NativeMicInputManager::new(audio.state(), mic_producers));
 
-            // Auto-connect the user's connected headset / default macOS microphone (skipping iPhone Continuity)
+            // Auto-connect a clean >= 44.1 kHz headset/Mac microphone (never 8 kHz Bluetooth HFP
+            // which forces macOS Bluetooth speakers into degraded mono hands-free audio!)
             let devices = list_audio_input_devices();
             let preferred_mic = devices
                 .iter()
-                .find(|d| !d.is_iphone && d.is_default)
-                .or_else(|| devices.iter().find(|d| !d.is_iphone));
+                .find(|d| !d.is_iphone && d.sample_rate >= 44_100 && d.name.to_lowercase().contains("externe"))
+                .or_else(|| devices.iter().find(|d| !d.is_iphone && d.sample_rate >= 44_100 && d.is_default))
+                .or_else(|| devices.iter().find(|d| !d.is_iphone && d.sample_rate >= 44_100));
             if let Some(mic) = preferred_mic {
                 match mic_inputs.select_device(MicChannelId::Mic1, Some(&mic.name)) {
-                    Ok(_) => info!("Auto-connected headset/Mac microphone '{}' to Mic 1", mic.name),
+                    Ok(_) => info!("Auto-connected headset/Mac microphone '{}' ({} Hz) to Mic 1", mic.name, mic.sample_rate),
                     Err(err) => warn!("Could not auto-connect microphone '{}': {err}", mic.name),
                 }
             }

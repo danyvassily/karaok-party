@@ -18,6 +18,30 @@ authors = ["Dany Vassily <dany@karaok-party.dev>"]
 repository = "https://github.com/danyvassily/karaok-party"
 rust-version = "1.85"
 
+# CRITICAL FOR REAL-TIME AUDIO IN `pnpm tauri dev`:
+# Compile DSP & audio decoding crates with full optimizations even in debug builds
+# so CoreAudio callbacks complete in < 0.05 ms (zero buffer underruns / zero crackling).
+[profile.dev.package.karaok-dsp]
+opt-level = 3
+
+[profile.dev.package.karaok-audio]
+opt-level = 3
+
+[profile.dev.package.karaok-core]
+opt-level = 3
+
+[profile.dev.package.karaok-ai]
+opt-level = 3
+
+[profile.dev.package.signalsmith-stretch]
+opt-level = 3
+
+[profile.dev.package.symphonia]
+opt-level = 3
+
+[profile.dev.package.rubato]
+opt-level = 3
+
 [workspace.dependencies]
 # Internal crates
 karaok-core = { path = "crates/karaok-core" }

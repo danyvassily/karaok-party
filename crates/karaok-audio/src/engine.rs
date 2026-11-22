@@ -274,8 +274,8 @@ impl AudioEngine {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Lock-free SPSC ring buffers (all pre-allocated once at startup):
-        // Music stereo ring buffer: ~200 ms headroom at 48 kHz (2 channels)
-        let music_rb = HeapRb::<f32>::new(MASTER_SAMPLE_RATE as usize * 2 / 5);
+        // Music stereo ring buffer: ~500 ms headroom at 48 kHz (2 channels) for rock-solid zero-underrun playback
+        let music_rb = HeapRb::<f32>::new(MASTER_SAMPLE_RATE as usize);
         let (music_prod, music_cons) = music_rb.split();
 
         // Mic 1 & Mic 2 mono ring buffers: ~340 ms headroom each
@@ -413,10 +413,13 @@ impl AudioEngine {
         let mut curr_l = 0.0_f32;
         let mut curr_r = 0.0_f32;
 
-        let mut render_next_stereo_frame = move || -> (f32, f32) {
-            // STRICT REAL-TIME RENDER STEP: zero allocations, zero locks, zero syscalls, zero unwrap().
+        let mut render_block = move |out_buf_l: &mut [f32], out_buf_r: &mut [f32]| {
+            // STRICT REAL-TIME RENDER BLOCK: zero allocations, zero locks, zero syscalls, zero unwrap().
+            let frames = out_buf_l.len().min(out_buf_r.len());
             let Some(ref mut c) = rt_bundle.inner else {
-                return (0.0, 0.0);
+                out_buf_l[..frames].fill(0.0);
+                out_buf_r[..frames].fill(0.0);
+                return;
             };
 
             if state.flush_music.swap(false, Ordering::AcqRel) {
@@ -425,6 +428,8 @@ impl AudioEngine {
 
             let is_playing = state.is_playing.load(Ordering::Relaxed);
             let effective_key = state.effective_key();
+            let mic1_connected = state.mic_telemetry[0].connected.load(Ordering::Relaxed);
+            let mic2_connected = state.mic_telemetry[1].connected.load(Ordering::Relaxed);
             let mic1_params = state.mic_params[0].load();
             let mic2_params = state.mic_params[1].load();
             let is_recording = state.is_recording.load(Ordering::Relaxed);
@@ -434,26 +439,36 @@ impl AudioEngine {
                 .min(250) as usize;
             let delay_frames = (delay_ms * MASTER_SAMPLE_RATE as usize) / 1000;
 
-            if !mic1_primed && c.mic1_cons.occupied_len() >= 256 {
-                mic1_primed = true;
-            }
-            if !mic2_primed && c.mic2_cons.occupied_len() >= 256 {
-                mic2_primed = true;
-            }
-            if c.mic1_cons.occupied_len() > 2400 {
-                let drop_n = c.mic1_cons.occupied_len() - 384;
-                for _ in 0..drop_n {
-                    let _ = c.mic1_cons.try_pop();
+            if mic1_connected {
+                if !mic1_primed && c.mic1_cons.occupied_len() >= 256 {
+                    mic1_primed = true;
                 }
-            }
-            if c.mic2_cons.occupied_len() > 2400 {
-                let drop_n = c.mic2_cons.occupied_len() - 384;
-                for _ in 0..drop_n {
-                    let _ = c.mic2_cons.try_pop();
+                if c.mic1_cons.occupied_len() > 2400 {
+                    let drop_n = c.mic1_cons.occupied_len() - 384;
+                    for _ in 0..drop_n {
+                        let _ = c.mic1_cons.try_pop();
+                    }
                 }
+            } else {
+                mic1_primed = false;
+                while c.mic1_cons.try_pop().is_some() {}
             }
 
-            // Produce one internal 48 kHz mixed stereo frame
+            if mic2_connected {
+                if !mic2_primed && c.mic2_cons.occupied_len() >= 256 {
+                    mic2_primed = true;
+                }
+                if c.mic2_cons.occupied_len() > 2400 {
+                    let drop_n = c.mic2_cons.occupied_len() - 384;
+                    for _ in 0..drop_n {
+                        let _ = c.mic2_cons.try_pop();
+                    }
+                }
+            } else {
+                mic2_primed = false;
+                while c.mic2_cons.try_pop().is_some() {}
+            }
+
             let mut produce_48k = || -> (f32, f32) {
                 let (raw_music_l, raw_music_r) = if is_playing {
                     (
@@ -467,36 +482,43 @@ impl AudioEngine {
                 let (instru_l, instru_r) =
                     calibration_delay.process(raw_music_l, raw_music_r, delay_frames);
 
-                let raw_m1 = if mic1_primed {
-                    if let Some(s) = c.mic1_cons.try_pop() {
-                        mic1_last = s;
-                        s
+                let (m1_l, m1_r) = if mic1_connected && !mic1_params.muted {
+                    let raw_m1 = if mic1_primed {
+                        if let Some(s) = c.mic1_cons.try_pop() {
+                            mic1_last = s;
+                            s
+                        } else {
+                            mic1_primed = false;
+                            mic1_last *= 0.9;
+                            mic1_last
+                        }
                     } else {
-                        mic1_primed = false;
                         mic1_last *= 0.9;
                         mic1_last
-                    }
+                    };
+                    mic1_dsp.process_sample(raw_m1, effective_key, &mic1_params)
                 } else {
-                    mic1_last *= 0.9;
-                    mic1_last
+                    (0.0, 0.0)
                 };
 
-                let raw_m2 = if mic2_primed {
-                    if let Some(s) = c.mic2_cons.try_pop() {
-                        mic2_last = s;
-                        s
+                let (m2_l, m2_r) = if mic2_connected && !mic2_params.muted {
+                    let raw_m2 = if mic2_primed {
+                        if let Some(s) = c.mic2_cons.try_pop() {
+                            mic2_last = s;
+                            s
+                        } else {
+                            mic2_primed = false;
+                            mic2_last *= 0.9;
+                            mic2_last
+                        }
                     } else {
-                        mic2_primed = false;
                         mic2_last *= 0.9;
                         mic2_last
-                    }
+                    };
+                    mic2_dsp.process_sample(raw_m2, effective_key, &mic2_params)
                 } else {
-                    mic2_last *= 0.9;
-                    mic2_last
+                    (0.0, 0.0)
                 };
-
-                let (m1_l, m1_r) = mic1_dsp.process_sample(raw_m1, effective_key, &mic1_params);
-                let (m2_l, m2_r) = mic2_dsp.process_sample(raw_m2, effective_key, &mic2_params);
 
                 if is_recording {
                     let _ = c.rec_prod.try_push(RecordedFrame {
@@ -515,31 +537,37 @@ impl AudioEngine {
                 )
             };
 
-            let out = if (rate_step - 1.0).abs() < 1e-6 {
-                produce_48k()
-            } else {
-                phase += rate_step;
-                while phase >= 1.0 {
-                    phase -= 1.0;
-                    prev_l = curr_l;
-                    prev_r = curr_r;
-                    let (nl, nr) = produce_48k();
-                    curr_l = nl;
-                    curr_r = nr;
-                }
-                let t = phase as f32;
-                (prev_l + (curr_l - prev_l) * t, prev_r + (curr_r - prev_r) * t)
-            };
+            let exact_48k = (rate_step - 1.0).abs() < 1e-6;
+            for i in 0..frames {
+                let (l, r) = if exact_48k {
+                    produce_48k()
+                } else {
+                    phase += rate_step;
+                    while phase >= 1.0 {
+                        phase -= 1.0;
+                        prev_l = curr_l;
+                        prev_r = curr_r;
+                        let (nl, nr) = produce_48k();
+                        curr_l = nl;
+                        curr_r = nr;
+                    }
+                    let t = phase as f32;
+                    (prev_l + (curr_l - prev_l) * t, prev_r + (curr_r - prev_r) * t)
+                };
+                out_buf_l[i] = l;
+                out_buf_r[i] = r;
+            }
 
-            // Publish lock-free telemetry
+            // Publish lock-free telemetry ONCE per CoreAudio callback (not 48,000x/sec!)
             state
                 .music_buffered_frames
                 .store((c.music_cons.occupied_len() / 2) as u64, Ordering::Relaxed);
             state.mic_telemetry[0].store_dsp(mic1_dsp.telemetry(), mic1_params.muted);
             state.mic_telemetry[1].store_dsp(mic2_dsp.telemetry(), mic2_params.muted);
-
-            out
         };
+
+        let mut scratch_l = [0.0_f32; 4096];
+        let mut scratch_r = [0.0_f32; 4096];
 
         let err_dev = resolved_name.clone();
         let err_fn = move |err: cpal::StreamError| {
@@ -551,17 +579,26 @@ impl AudioEngine {
                 .build_output_stream(
                     &config,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        for frame in data.chunks_exact_mut(out_channels) {
-                            let (l, r) = render_next_stereo_frame();
-                            if out_channels == 1 {
-                                frame[0] = 0.5 * (l + r);
-                            } else {
-                                frame[0] = l;
-                                frame[1] = r;
-                                for extra in frame.iter_mut().skip(2) {
-                                    *extra = 0.0;
+                        let total_frames = data.len() / out_channels;
+                        let mut offset = 0usize;
+                        while offset < total_frames {
+                            let n = (total_frames - offset).min(scratch_l.len());
+                            render_block(&mut scratch_l[..n], &mut scratch_r[..n]);
+                            for i in 0..n {
+                                let base = (offset + i) * out_channels;
+                                let l = scratch_l[i];
+                                let r = scratch_r[i];
+                                if out_channels == 1 {
+                                    data[base] = 0.5 * (l + r);
+                                } else {
+                                    data[base] = l;
+                                    data[base + 1] = r;
+                                    for ch in 2..out_channels {
+                                        data[base + ch] = 0.0;
+                                    }
                                 }
                             }
+                            offset += n;
                         }
                     },
                     err_fn,
@@ -572,19 +609,28 @@ impl AudioEngine {
                 .build_output_stream(
                     &config,
                     move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        for frame in data.chunks_exact_mut(out_channels) {
-                            let (l, r) = render_next_stereo_frame();
+                        let total_frames = data.len() / out_channels;
+                        let mut offset = 0usize;
+                        while offset < total_frames {
+                            let n = (total_frames - offset).min(scratch_l.len());
+                            render_block(&mut scratch_l[..n], &mut scratch_r[..n]);
                             let to_i16 =
                                 |s: f32| (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
-                            if out_channels == 1 {
-                                frame[0] = to_i16(0.5 * (l + r));
-                            } else {
-                                frame[0] = to_i16(l);
-                                frame[1] = to_i16(r);
-                                for extra in frame.iter_mut().skip(2) {
-                                    *extra = 0;
+                            for i in 0..n {
+                                let base = (offset + i) * out_channels;
+                                let l = scratch_l[i];
+                                let r = scratch_r[i];
+                                if out_channels == 1 {
+                                    data[base] = to_i16(0.5 * (l + r));
+                                } else {
+                                    data[base] = to_i16(l);
+                                    data[base + 1] = to_i16(r);
+                                    for ch in 2..out_channels {
+                                        data[base + ch] = 0;
+                                    }
                                 }
                             }
+                            offset += n;
                         }
                     },
                     err_fn,
@@ -595,20 +641,29 @@ impl AudioEngine {
                 .build_output_stream(
                     &config,
                     move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                        for frame in data.chunks_exact_mut(out_channels) {
-                            let (l, r) = render_next_stereo_frame();
+                        let total_frames = data.len() / out_channels;
+                        let mut offset = 0usize;
+                        while offset < total_frames {
+                            let n = (total_frames - offset).min(scratch_l.len());
+                            render_block(&mut scratch_l[..n], &mut scratch_r[..n]);
                             let to_u16 = |s: f32| {
                                 ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32).round() as u16
                             };
-                            if out_channels == 1 {
-                                frame[0] = to_u16(0.5 * (l + r));
-                            } else {
-                                frame[0] = to_u16(l);
-                                frame[1] = to_u16(r);
-                                for extra in frame.iter_mut().skip(2) {
-                                    *extra = u16::MAX / 2;
+                            for i in 0..n {
+                                let base = (offset + i) * out_channels;
+                                let l = scratch_l[i];
+                                let r = scratch_r[i];
+                                if out_channels == 1 {
+                                    data[base] = to_u16(0.5 * (l + r));
+                                } else {
+                                    data[base] = to_u16(l);
+                                    data[base + 1] = to_u16(r);
+                                    for ch in 2..out_channels {
+                                        data[base + ch] = u16::MAX / 2;
+                                    }
                                 }
                             }
+                            offset += n;
                         }
                     },
                     err_fn,
