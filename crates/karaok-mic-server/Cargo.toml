@@ -1,0 +1,25 @@
+[package]
+name = "karaok-mic-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+karaok-core.workspace = true
+karaok-dsp.workspace = true
+karaok-audio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+mdns-sd.workspace = true
+qrcode.workspace = true
+local-ip-address.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true

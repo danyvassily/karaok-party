@@ -1,0 +1,19 @@
+[package]
+name = "karaok-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+karaok-core.workspace = true
+karaok-dsp.workspace = true
+cpal.workspace = true
+ringbuf.workspace = true
+symphonia.workspace = true
+rubato.workspace = true
+signalsmith-stretch.workspace = true
+hound.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true

@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for Karaok Party main studio and TV second-screen windows",
+  "windows": ["main", "tv"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-show",
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "core:webview:allow-create-webview-window",
+    "dialog:default",
+    "shell:default"
+  ]
+}

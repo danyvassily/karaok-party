@@ -1,0 +1,27 @@
+[package]
+name = "karaok-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Optional hardware-accelerated AI backends (require model weights and/or cmake)
+burn-metal = []
+ort-coreml = []
+whisper-metal = []
+
+[dependencies]
+karaok-core.workspace = true
+karaok-audio.workspace = true
+hound.workspace = true
+rustfft.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+url.workspace = true

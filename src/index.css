@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+:root {
+  --stage-void: #07080c;
+  --console-surface: #11131b;
+  --console-elevated: #181c27;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --mic1-sky: #38bdf8;
+  --mic2-coral: #fb7185;
+  --gold-pitch: #fbbf24;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+  background-color: var(--stage-void);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom studio range sliders */
+input[type="range"].studio-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.12);
+  height: 5px;
+  border-radius: 9999px;
+  outline: none;
+}
+
+input[type="range"].studio-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #f8fafc;
+  border: 2px solid #38bdf8;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.45);
+}
+
+input[type="range"].studio-slider-coral::-webkit-slider-thumb {
+  border-color: #fb7185;
+  box-shadow: 0 0 8px rgba(251, 113, 133, 0.45);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Subtle macOS Overlay titlebar drag zone */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}

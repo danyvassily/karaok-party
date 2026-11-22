@@ -1,0 +1,24 @@
+# Dependencies & Build Artifacts
+/target
+**/target
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Tauri & macOS
+src-tauri/target/
+src-tauri/gen/schemas/
+.DS_Store
+*.swp
+*.swo
+
+# Local DB, Certs & Runtime Cache
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+.env
+.env.local
+certs/
+stems/
+recordings/

@@ -1,0 +1,33 @@
+[package]
+name = "karaok-party"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Studio-grade local-first macOS Karaoke application in Rust"
+
+[lib]
+name = "karaok_party_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+karaok-core.workspace = true
+karaok-dsp.workspace = true
+karaok-audio.workspace = true
+karaok-mic-server.workspace = true
+karaok-ai.workspace = true
+karaok-db.workspace = true
+
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-shell.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+chrono.workspace = true
